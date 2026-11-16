@@ -51,12 +51,14 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
+#include <pexpert/device_tree.h>
 #include <pexpert/pexpert.h>
 #include <miscfs/devfs/devfs.h>
 #include <sys/conf.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
 #include <sys/hakios.audio.h>
+#include "hakios.haptic_fw.h"
 #include <sys/hakios.input.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -125,21 +127,43 @@ wait_ms(uint32_t ms)
 /* ---- pins ------------------------------------------------------------------------------------------ */
 
 #define TLMM_PHYS               0x0f100000UL
-#define TLMM_SIZE               0x100000UL
+/* GPIO54 is the highest pin this driver touches (register at 0x36000, plus GPIO_IO). */
+#define TLMM_SIZE               0x40000UL
 #define GPIO_CFG(n)             (tlmm + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
 #define GPIO_IO(n)              (tlmm + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
 #define CFG_PULL_UP             3
 #define CFG_OUTPUT              (1u << 9)
 
-#define PIN_SDA                 36      /* the serial engine's first pin is the data line, the second the clock */
-#define PIN_SCL                 37
-#define PIN_RESET               35
-#define PIN_INT                 18
+static bool board_peridot;
+static unsigned PIN_SDA = 36;           /* the serial engine's first pin is the data line, the second the clock */
+static unsigned PIN_SCL = 37;
+static unsigned PIN_RESET = 35;
+static unsigned PIN_INT = 18;
+
+/* The loader writes the platform name into /arm-io/device_type. */
+static void
+board_detect(void)
+{
+	DTEntry entry;
+	void const *prop;
+	unsigned int size;
+
+	board_peridot = false;
+	if (SecureDTLookupEntry(NULL, "/arm-io", &entry) == kSuccess &&
+	    SecureDTGetProperty(entry, "device_type", &prop, &size) == kSuccess &&
+	    size >= 7 && memcmp(prop, "peridot", 7) == 0) {
+		board_peridot = true;
+		PIN_SDA = 52;           /* qupv3_se0_i2c: gpio52 data, gpio53 clock */
+		PIN_SCL = 53;
+		PIN_RESET = 30;         /* awinic_gpio_reset */
+		PIN_INT = 54;           /* awinic_gpio_int */
+	}
+}
 
 static void
 show_pins(void)
 {
-	static const struct {
+	const struct {
 		unsigned pin;
 		const char *what;
 	} pins[] = { { PIN_SDA, "I2C data" }, { PIN_SCL, "I2C clock" }, { PIN_RESET, "reset" }, { PIN_INT, "interrupt" } };
@@ -568,8 +592,14 @@ load_waveforms(void)
 	uint8_t address[2], back[64];
 
 	if (file == NULL || size < 8) {
-		say("haptic: no aw8697_haptic.bin in fw/ of the small image (fw-haptic/ when it is built)\n");
-		return false;
+		if (board_peridot) {
+			file = hakios_haptic_waveforms;
+			size = sizeof(hakios_haptic_waveforms);
+			say("haptic: peridot's waveforms, built in: %llu bytes\n", size);
+		} else {
+			say("haptic: no aw8697_haptic.bin in fw/ of the small image (fw-haptic/ when it is built)\n");
+			return false;
+		}
 	}
 	for (uint64_t i = 2; i < size; i++) {
 		sum += file[i];
@@ -939,6 +969,8 @@ haptic_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	bool loaded = false;
 
+	board_detect();
+
 	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	say("haptic: level %u: %s\n", level, level == 1 ? "a look, reading only" : level == 2 ? "the reset released, registers read" :
 	    level == 3 ? "the chip configured and its waveforms loaded, nothing played" : level == 4 ? "one effect played" :
@@ -986,7 +1018,14 @@ hakios_haptic_init(void)
 {
 	thread_t thread;
 
-	if (!PE_parse_boot_argn("haptic", &level, sizeof(level)) || level == 0) {
+	board_detect();
+	if (!PE_parse_boot_argn("haptic", &level, sizeof(level))) {
+		if (!board_peridot) {
+			return;
+		}
+		level = 5;      /* peridot: the motor for iOS by default; haptic=0 turns it off */
+	}
+	if (level == 0) {
 		return;
 	}
 	if (level > 5) {

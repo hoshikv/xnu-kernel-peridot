@@ -4,4 +4,5 @@
 
 driver BT
 	file    bsd/dev/hakios.bt.c
-	help    the Bluetooth half of the WCN6750: step one, a read-only look at its three pins (bt=1)
+	file    iokit/Kernel/hakios.bluetooth.cpp iokitcpp
+	help    the WCN6750 Bluetooth transport: QUP UART, RPMh rails, QCA firmware, H4 socket and IOKit service (bt=1, bt_step=N)

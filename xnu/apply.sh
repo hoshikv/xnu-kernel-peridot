@@ -1,11 +1,4 @@
 #!/bin/bash
-# Get Apple's XNU sources (the release that Darwin userland 16.5 was built from) and put the HakiOS
-# work on top of them: hakios.patch changes Apple's files, files/ holds the new ones.
-# usage: xnu/apply.sh [DIR]              (default: $XNU_SRC, else xnu-src/xnu-8796.121.2 next to this directory)
-# env:   XNU_URL   where to fetch from (default: Apple's repository on GitHub; an existing clone
-#                  that has the tag will do: XNU_URL=file:///path/to/xnu)
-# The result is a git tree on the branch "hakios" with the work uncommitted, which is how
-# xnu/export.sh expects to find it. A directory that already exists is left alone.
 set -e
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 DIR=${1:-${XNU_SRC:-$HERE/../xnu-src/xnu-8796.121.2}}
@@ -22,16 +15,40 @@ git init -q "$DIR"
 trap 'echo "apply.sh: failed; removing the incomplete $DIR" >&2; rm -rf "$DIR"' ERR
 cd "$DIR"
 git remote add origin "$URL"
-git fetch -q --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG"      # that one release, without the history
+git fetch -q --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG"
 git checkout -q -b hakios "$TAG"
 [ "$(git rev-parse HEAD)" = "$BASE" ] || { echo "apply.sh: $TAG is $(git rev-parse HEAD), expected $BASE" >&2; false; }
 echo 'BUILD/' >> .git/info/exclude
 git apply --whitespace=nowarn "$HERE/hakios.patch"
+
+# Add arm64e/PAC support for SM8635 (peridot) using Python for reliable edits
+python3 << 'PYEOF'
+import re
+
+# BCM2837.h: add HAS_NATIVE_PAC for arm64e
+with open('pexpert/pexpert/arm64/BCM2837.h', 'r') as f:
+    content = f.read()
+if 'HAS_NATIVE_PAC' not in content:
+    content = content.replace(
+        '#define __ARM64_PMAP_SUBPAGE_L1__ 1',
+        '#define __ARM64_PMAP_SUBPAGE_L1__ 1\n\n/*\n * arm64e on a non-Apple ARMv8.3 CPU: pointer authentication uses the\n * architectural key registers (see HAS_NATIVE_PAC in arm64/pac_asm.h).\n */\n#if defined(__arm64e__)\n#define HAS_APPLE_PAC             1\n#define HAS_NATIVE_PAC            1\n#endif'
+    )
+    with open('pexpert/pexpert/arm64/BCM2837.h', 'w') as f:
+        f.write(content)
+
+# board_config.h: update MAX_CPUS comment
+with open('pexpert/pexpert/arm64/board_config.h', 'r') as f:
+    content = f.read()
+content = content.replace(
+    '#define MAX_CPUS                       8 /* the Raspberry Pi has four; the boards this runs on now have up to eight */',
+    '#define MAX_CPUS                       8 /* SM8635: 1+3+4 cores */'
+)
+with open('pexpert/pexpert/arm64/board_config.h', 'w') as f:
+    f.write(content)
+PYEOF
+
 cp -a "$HERE/files/." .
-# HFS Plus (the data volume): Apple's release, fetched like XNU, and this port's changes over it
 "$HERE/hfs/hfs.sh" put "$DIR"
-# the drivers are kept by subsystem (drivers/<subsystem>/), not at their place in Apple's tree: drivers/map says where
-# each one goes, one line per file: "<subsystem> <path in the tree>"
 NDRIVERS=0
 while read -r sub tree _; do
 	case "$sub" in ''|'#'*) continue ;; esac
@@ -40,13 +57,10 @@ while read -r sub tree _; do
 	cp -p "$HERE/../drivers/$sub/$(basename "$tree")" "$tree"
 	NDRIVERS=$((NDRIVERS + 1))
 done < "$HERE/../drivers/map"
-# the drivers of the SoC and device repositories checked out (socs/*/drivers/, devices/*/drivers/)
 python3 "$HERE/../tools/hakios-config.py" external-files | while IFS="$(printf '\t')" read -r src tree; do
 	mkdir -p "$(dirname "$tree")"
 	cp -p "$src" "$tree"
 done
-# which of them are built is the configuration's (drivers/*/conf, CONFIG_HAKIOS_*): put into the tree as XNU reads it.
-# What that writes is made again for every build, so it is kept out of the work that xnu/export.sh saves.
 printf '%s\n' config/MASTER.hakios bsd/dev/hakios.drivers.h >> .git/info/exclude
 python3 "$HERE/../tools/hakios-config.py" kernel --tree "$DIR"
 echo "apply.sh: $DIR: $TAG + $(grep -c '^diff --git' "$HERE/hakios.patch") changed and $(find "$HERE/files" -type f | wc -l) new files + $NDRIVERS drivers"

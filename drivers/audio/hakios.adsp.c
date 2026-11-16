@@ -20,8 +20,8 @@
  *   - processor 2 (not 13) in the shared memory; its SMP2P items 443 (its) and 429 (ours), its
  *     last words in item 423; GLINK's three items in our partition with it
  *   - its doorbells are IPCC client 3 (LPASS): signal 0 GLINK, signal 2 SMP2P
- *   - TrustZone knows it as image 1; its memory is 0x86700000, 64 MB (dt: qcom,lpass@3700000,
- *     reserved-memory adsp@86700000), every byte of which the image takes
+ *   - TrustZone knows it as image 1; its memory is 0x9d400000, 69 MB (dt: qcom,lpass@3700000,
+ *     reserved-memory adspslpi_region@9d400000), every byte of which the image takes
  *   - the always-on processor is told of it as "adsp"
  *   - the Wi-Fi DSP may be running at the same time (wifi=1): the mailbox to the always-on
  *     processor and the lock for allocating in the shared memory are the two things both use,
@@ -89,6 +89,7 @@
 #include <sys/errno.h>
 #include <sys/kauth.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <sys/vnode.h>
 #include <sys/vnode_internal.h>
@@ -287,7 +288,7 @@ put(struct block *b, const char *name, uint32_t offset, uint32_t value)
 
 /* ---- the shared memory (hakios.wifi.c, step 1) --------------------------------------------------- */
 
-#define SMEM_PHYS               0x80900000UL
+#define SMEM_PHYS               0x81d00000UL
 #define SMEM_SIZE               0x00200000u
 #define SMEM_US                 0
 #define SMEM_ADSP               2               /* dt: qcom,remote-pid of qcom,smp2p-adsp and qcom,glink/adsp */
@@ -329,15 +330,31 @@ struct smem_item {
 
 static const volatile uint8_t *smem;
 
+extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
+
+/*
+ * The shared memory is mapped cacheable here (an uncached mapping of its last page takes an
+ * external abort on this platform). The DSP is not coherent with our caches, so the lines we
+ * touch are cleaned and invalidated at the point of coherency around every access.
+ */
+static void
+smem_sync(uint32_t offset, uint32_t size)
+{
+	vm_offset_t start = (vm_offset_t)smem + (offset & ~63u);
+
+	FlushPoC_DcacheRegion(start, (vm_offset_t)smem + offset + size - start);
+}
+
 static bool
 smem_peek(uint64_t offset, void *to, uint32_t size)
 {
 	if (smem == NULL) {
-		smem = (const volatile uint8_t *)ml_io_map_unmappable(SMEM_PHYS, SMEM_SIZE, VM_WIMG_WCOMB);
+		smem = (const volatile uint8_t *)ml_io_map_unmappable(SMEM_PHYS, SMEM_SIZE, VM_WIMG_COPYBACK);
 	}
 	if (offset + size > SMEM_SIZE) {
 		return false;
 	}
+	smem_sync((uint32_t)offset, size);
 	for (uint32_t i = 0; i < size; i++) {
 		((uint8_t *)to)[i] = smem[offset + i];
 	}
@@ -348,11 +365,13 @@ static void
 smem_poke(uint32_t offset, uint32_t value)
 {
 	wr((vm_offset_t)smem + offset, value);
+	smem_sync(offset, sizeof(value));
 }
 
 static uint32_t
 smem_word(uint32_t offset)
 {
+	smem_sync(offset, sizeof(uint32_t));
 	return rd((vm_offset_t)smem + offset);
 }
 
@@ -402,10 +421,6 @@ smem_items(uint32_t partition, uint32_t cacheline, struct smem_item *found, unsi
 		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.size > header.size) {
 			break;
 		}
-		/*
-		 * The DSP can write this header: padding larger than the item would make the size below wrap to about 4 GB,
-		 * and an item that ends beyond its partition would send the readers out of the shared memory. Stop at it.
-		 */
 		if (entry.padding_data > entry.size ||
 		    (uint64_t)at + sizeof(entry) + entry.padding_header + entry.size > header.size) {
 			break;
@@ -423,7 +438,6 @@ smem_items(uint32_t partition, uint32_t cacheline, struct smem_item *found, unsi
 	}
 	step_back = ((uint32_t)sizeof(entry) + cacheline - 1) & ~(cacheline - 1);
 	for (at = header.size - step_back; at > header.free_cached && at < header.size;) {
-		/* (padding larger than the item would make the size below wrap to about 4 GB) */
 		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.size > at ||
 		    entry.padding_data > entry.size) {
 			break;
@@ -625,7 +639,7 @@ static struct block aoss = { "mailbox", 0x0c300000, 0x400 };
 #define IPCC_GLINK              0u
 #define IPCC_SMP2P              2u
 
-static struct block ipcc = { "ipcc", 0x00408000, 0x1000 };
+static struct block ipcc = { "ipcc", 0x00406000, 0x1000 };
 
 static struct {
 	uint32_t glink, smp2p, said;
@@ -693,7 +707,6 @@ mailbox_open(void)
 	}
 	box = get(&aoss, "our mailbox", QMP_OUR_BOX);
 	size = get(&aoss, "our mailbox's size", QMP_OUR_BOX_SIZE);
-	/* (box and size come from the always-on processor: "box + size" could wrap in 32 bits and pass, so it is compared as a difference) */
 	if (size < QMP_MESSAGE + 4 || box < 0x3c || box >= aoss.size || size > aoss.size - box || (box & 3)) {
 		printf("adsp: %u: our mailbox is not where a message fits\n", step);
 		return false;
@@ -794,7 +807,7 @@ out:
  * the list of its levels that the boot loader's command database keeps (cmd-db.c), the first
  * position at or above the level wanted.
  */
-#define CMD_DB_PHYS             0x80860000UL
+#define CMD_DB_PHYS             0x81c60000UL
 #define CMD_DB_SIZE             0x20000UL
 
 struct cmd_db_slave {
@@ -816,20 +829,46 @@ struct cmd_db_entry {
 
 static const struct cmd_db_header *cmd_db;
 
-static struct block rsc = { "rsc", 0x18220000, 0x10000 };
+static struct block rsc = { "rsc", 0x17a20000, 0x10000 };  /* dt: apps_rsc drv@2, whose tcs-offset is 0xd00 */
 #define RSC_TCS_BASE            0xd00
 #define RSC_IRQ_STATUS          (RSC_TCS_BASE + 0x04)   /* a bit per TCS: done */
 #define RSC_IRQ_CLEAR           (RSC_TCS_BASE + 0x08)
 #define RSC_TCS(n)              (RSC_TCS_BASE + 672 * (n))
-#define TCS_WAIT_FOR_DONE       0x10
-#define TCS_CONTROL             0x14
-#define TCS_STATUS              0x18                    /* not zero: idle */
-#define TCS_ENABLED             0x1c
-#define TCS_COMMAND(c)          (0x30 + 20 * (c))       /* message id, address, value, status */
 #define TCS_ACTIVE_MODE         (1u << 16)
 #define TCS_TRIGGER             (1u << 24)
-#define MSGID_WRITE_WAITED      (8u | 1u << 8 | 1u << 16)       /* four bytes, an answer wanted, a write */
+
 #define RPMH_TCS                0                       /* the first of the two for requests made at once */
+
+/* The layout of a TCS depends on the sequencer's version: 2.7 has 20-byte commands, 3.0 has 24. */
+static uint32_t tcs_wait_for_done = 0x10, tcs_control = 0x14, tcs_status = 0x18, tcs_enabled = 0x1c;
+static uint32_t tcs_command = 0x30, tcs_command_size = 20;
+static bool rsc_layout_read;
+
+static void
+rsc_layout(void)
+{
+	uint32_t id, major, minor;
+
+	if (rsc_layout_read) {
+		return;
+	}
+	need(&rsc);
+	id = rd(rsc.base + 0);
+	major = (id >> 16) & 0xff;
+	minor = (id >> 8) & 0xff;
+	if (major >= 3) {
+		tcs_wait_for_done = 0x20;
+		tcs_control = 0x24;
+		tcs_status = 0x28;
+		tcs_enabled = 0x2c;
+		tcs_command = 0x34;
+		tcs_command_size = 24;
+	}
+	printf("adsp: %u: RSC version %u.%u (%#x): TCS status at %#x, commands at %#x/%u\n", step, major, minor, id,
+	    RSC_TCS(RPMH_TCS) + tcs_status, RSC_TCS(RPMH_TCS) + tcs_command, tcs_command_size);
+	rsc_layout_read = true;
+}
+#define MSGID_WRITE_WAITED      (8u | 1u << 8 | 1u << 16)       /* four bytes, an answer wanted, a write */
 
 /* The level position RPMh takes for that rail and level; -1: not found. */
 static int
@@ -908,14 +947,13 @@ rails(uint32_t level)
 		values[r] = (uint32_t)position;
 	}
 	need(&rsc);
-	/* (on a panic's way back to the loader no lock is taken: the other processors are stopped, and one of them may hold this one for good) */
 	if (!leaving) {
 		lck_mtx_lock(&hakios_rsc_lock);
 	}
-	/* (the boot loader leaves the trigger set after its last request, done: idle is what the status says) */
-	if (rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS) == 0) {
+	rsc_layout();
+	if (rd(rsc.base + RSC_TCS(RPMH_TCS) + tcs_status) == 0) {
 		printf("adsp: %u: TCS %u of the sequencer is busy (status %#x, control %#x): the rails are not asked\n", step, RPMH_TCS,
-		    rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS), rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL));
+		    rd(rsc.base + RSC_TCS(RPMH_TCS) + tcs_status), rd(rsc.base + RSC_TCS(RPMH_TCS) + tcs_control));
 		if (!leaving) {
 			lck_mtx_unlock(&hakios_rsc_lock);
 		}
@@ -927,16 +965,16 @@ rails(uint32_t level)
 	hold();
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
 	for (unsigned r = 0; r < 2; r++) {
-		wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r), MSGID_WRITE_WAITED);
-		wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r) + 4, addresses[r]);
-		wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r) + 8, values[r]);
+		wr(rsc.base + RSC_TCS(RPMH_TCS) + tcs_command + tcs_command_size * r, MSGID_WRITE_WAITED);
+		wr(rsc.base + RSC_TCS(RPMH_TCS) + tcs_command + tcs_command_size * r + 4, addresses[r]);
+		wr(rsc.base + RSC_TCS(RPMH_TCS) + tcs_command + tcs_command_size * r + 8, values[r]);
 	}
-	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_WAIT_FOR_DONE, 3);
-	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 3);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + tcs_wait_for_done, 3);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + tcs_enabled, 3);
 	settle();
-	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~TCS_TRIGGER);
-	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) | TCS_ACTIVE_MODE);
-	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) | TCS_TRIGGER);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + tcs_control, rd(rsc.base + RSC_TCS(RPMH_TCS) + tcs_control) & ~TCS_TRIGGER);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + tcs_control, rd(rsc.base + RSC_TCS(RPMH_TCS) + tcs_control) | TCS_ACTIVE_MODE);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + tcs_control, rd(rsc.base + RSC_TCS(RPMH_TCS) + tcs_control) | TCS_TRIGGER);
 	began = now_us();
 	while (now_us() - began < 100000) {
 		done = rd(rsc.base + RSC_IRQ_STATUS) & (1u << RPMH_TCS);
@@ -946,11 +984,11 @@ rails(uint32_t level)
 		sleep_us(50);
 	}
 	printf("adsp: %u: RPMh %s after %llu us; the commands' status %#x %#x, the TCS's %#x\n", step, done ? "HAS DONE IT" :
-	    "HAS NOT SAID DONE", now_us() - began, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(0) + 12),
-	    rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(1) + 12), rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS));
+	    "HAS NOT SAID DONE", now_us() - began, rd(rsc.base + RSC_TCS(RPMH_TCS) + tcs_command + 12),
+	    rd(rsc.base + RSC_TCS(RPMH_TCS) + tcs_command + tcs_command_size + 12), rd(rsc.base + RSC_TCS(RPMH_TCS) + tcs_status));
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
-	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
-	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 0);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + tcs_control, rd(rsc.base + RSC_TCS(RPMH_TCS) + tcs_control) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + tcs_enabled, 0);
 	if (!leaving) {
 		lck_mtx_unlock(&hakios_rsc_lock);
 	}
@@ -983,9 +1021,12 @@ step_survey(void)
 
 /* ---- step 2: the firmware -------------------------------------------------------------------------- */
 
-#define ADSP_MEMORY             0x86700000u     /* dt: reserved-memory adsp@86700000, memory-region of qcom,lpass@3700000 */
-#define ADSP_MEMORY_SIZE        0x04000000u
+#define ADSP_MEMORY             0x9d400000u     /* dt: reserved-memory adspslpi_region@9d400000 (peridot: 0x4500000 bytes) */
+#define ADSP_MEMORY_SIZE        0x04500000u
+#define ADSP_DTB_MEMORY         0xa1900000u     /* dt: reserved-memory q6_adsp_dtb_region@a1900000 (0x80000 bytes) */
+#define ADSP_DTB_MEMORY_SIZE    0x00080000u
 #define PAS_ADSP                1               /* dt: qcom,pas-id */
+#define PAS_ADSP_DTB            0x24            /* dt: qcom,dtb-pas-id (cliffs-adsp-pas) */
 
 
 /*
@@ -1079,7 +1120,7 @@ image_file(const char *name, uint64_t *size)
 
 
 #define MDT_HASH(flags)         (((flags) >> 24 & 7) == 2)
-#define MAX_SEGMENTS            48
+#define MAX_SEGMENTS            64
 
 struct elf_segment {
 	uint32_t type, offset, vaddr, paddr, file_size, memory_size, flags, align;
@@ -1096,6 +1137,28 @@ static struct {
 	unsigned segments;
 	uint32_t size;
 } image;
+
+/*
+ * Peridot's ADSP takes a separate device tree, loaded through its own PAS channel (0x24) just
+ * past the DSP's own memory.  It is relocatable: the header's lowest segment address is not the
+ * address it runs at, so the segments are copied from that lowest address into a cleared
+ * 0xa1900000, the size TrustZone is told is their span.
+ */
+static struct {
+	const uint8_t *header;
+	uint64_t header_size;
+	bool header_from_root;
+	struct {
+		uint32_t at, paddr;
+		uint32_t file_size, memory_size;
+		const uint8_t *file;
+		bool from_root;
+	} segment[MAX_SEGMENTS];
+	unsigned segments;
+	uint32_t size;
+} dtb_image;
+
+static bool dtb_started;
 
 /* The image's files given back, if they were read into memory of ours. */
 static void
@@ -1127,7 +1190,6 @@ step_firmware(void)
 	const uint8_t *header;
 	uint64_t size = 0, files = 0;
 	uint32_t count, hashes = 0, lowest = ~0u, highest = 0;
-	uint8_t first[4] = { 0 };
 
 	announce("find the audio DSP's image in the small image or on the root, and check it against its own header");
 	image_forget();
@@ -1139,12 +1201,9 @@ step_firmware(void)
 	image.header = header;
 	image.header_size = size;
 	count = size >= 52 + 2 * 32 ? header[44] | header[45] << 8 : 0;
-	/* (a file of 1 to 4 bytes is shorter than what is compared and printed: both look only at what is there) */
-	memcpy(first, header, size < sizeof(first) ? size : sizeof(first));
-	if (size < 5 || memcmp(header, "\177ELF\1", 5) != 0 || count < 3 || count > MAX_SEGMENTS || 52 + 32 * count > size ||
-	    size > PAGE_SIZE) {
-		printf("adsp: %u: fw/adsp.mdt is not such a header (%02x %02x %02x %02x, %u segments, %llu bytes)\n", step, first[0],
-		    first[1], first[2], first[3], count, size);
+	if (memcmp(header, "\177ELF\1", 5) != 0 || count < 3 || count > MAX_SEGMENTS || 52 + 32 * count > size || size > PAGE_SIZE) {
+		printf("adsp: %u: fw/adsp.mdt is not such a header (%02x %02x %02x %02x, %u segments, %llu bytes)\n", step, header[0],
+		    header[1], header[2], header[3], count, size);
 		goto fail;
 	}
 	for (uint32_t i = 0; i < count; i++) {
@@ -1177,8 +1236,6 @@ step_firmware(void)
 			}
 			if (file_size != segment.file_size) {
 				printf("adsp: %u: fw/%s has %llu bytes, the header says %u\n", step, name, file_size, segment.file_size);
-				/* (the file is given back with the size it was allocated with, not the header's: kfree_data() needs that) */
-				image.segment[image.segments].file_size = (uint32_t)file_size;
 				image.segments++;               /* (for its file to be given back) */
 				goto fail;
 			}
@@ -1278,7 +1335,6 @@ our_item_find(void)
 {
 	uint32_t size = 0, at = smem_item(ITEM_SMP2P_OURS, &size);
 
-	/* (step_our_item() writes the whole struct there without a bounds check: it has to lie inside the SMEM window) */
 	return at != 0 && size >= sizeof(struct smp2p) && (uint64_t)at + sizeof(struct smp2p) <= SMEM_SIZE ? at : 0;
 }
 
@@ -1369,6 +1425,192 @@ dsp_ask_to_stop(uint32_t bound_ms)
 
 static void link_stop(void);
 
+static void
+dtb_forget(void)
+{
+	if (dtb_image.header != NULL && dtb_image.header_from_root) {
+		void *data = (void *)(uintptr_t)dtb_image.header;
+
+		kfree_data(data, dtb_image.header_size);
+	}
+	for (unsigned s = 0; s < dtb_image.segments; s++) {
+		if (dtb_image.segment[s].file != NULL && dtb_image.segment[s].from_root) {
+			void *data = (void *)(uintptr_t)dtb_image.segment[s].file;
+
+			kfree_data(data, dtb_image.segment[s].file_size);
+		}
+	}
+	bzero(&dtb_image, sizeof(dtb_image));
+}
+
+/* A DTB file: first in the small image, where ADSP=1 userland/build.sh puts fw-audio/, then /fw on the root. */
+static const uint8_t *
+dtb_file(const char *name, uint64_t *size, bool *from_root)
+{
+	const uint8_t *data = hakios_image_file("fw", name, size, NULL);
+
+	if (data != NULL) {
+		*from_root = false;
+		return data;
+	}
+	data = root_file(name, size);
+	if (data != NULL) {
+		*from_root = true;
+	}
+	return data;
+}
+
+/*
+ * Load and start adsp_dtb.mdt through PAS 0x24.  Linux does this in adsp_load(), before the
+ * DSP's own image is authenticated; its absence is not fatal here, so an older root image can
+ * still bring the DSP up (the cost is that a DSP that needs its DT will not answer).
+ */
+static bool
+dtb_load(void)
+{
+	struct elf_segment segment;
+	const uint8_t *header;
+	uint64_t size = 0, files = 0;
+	uint32_t count, hashes = 0, lowest = ~0u, highest = 0;
+	uint64_t answer = ~0ull;
+	int32_t result;
+	vm_offset_t page = 0;
+	uint8_t *memory;
+	bool ok = false;
+
+	dtb_forget();
+	header = dtb_file("adsp_dtb.mdt", &size, &dtb_image.header_from_root);
+	if (header == NULL) {
+		printf("adsp: %u: no fw/adsp_dtb.mdt in the small image nor on the root: starting the audio DSP without its "
+		    "device tree\n", step);
+		return true;
+	}
+	dtb_image.header = header;
+	dtb_image.header_size = size;
+	count = size >= 52 + 2 * 32 ? header[44] | header[45] << 8 : 0;
+	if (memcmp(header, "\177ELF\1", 5) != 0 || count < 1 || count > MAX_SEGMENTS || 52 + 32 * count > size ||
+	    size > PAGE_SIZE) {
+		printf("adsp: %u: fw/adsp_dtb.mdt is not such a header (%02x %02x %02x %02x, %u segments, %llu bytes)\n", step,
+		    header[0], header[1], header[2], header[3], count, size);
+		goto fail;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		char name[24];
+		uint64_t file_size = 0;
+
+		memcpy(&segment, header + 52 + 32 * i, sizeof(segment));
+		if (MDT_HASH(segment.flags)) {
+			hashes = segment.file_size;
+			continue;
+		}
+		if (segment.type != 1 || segment.memory_size == 0) {
+			continue;
+		}
+		if (segment.file_size > segment.memory_size) {
+			printf("adsp: %u: the DTB's segment %u is longer than the memory it asks for\n", step, i);
+			goto fail;
+		}
+		if (dtb_image.segments == MAX_SEGMENTS) {
+			printf("adsp: %u: the DTB has too many segments\n", step);
+			goto fail;
+		}
+		snprintf(name, sizeof(name), "adsp_dtb.b%02u", i);
+		if (segment.file_size != 0) {
+			dtb_image.segment[dtb_image.segments].file = dtb_file(name, &file_size,
+			    &dtb_image.segment[dtb_image.segments].from_root);
+			if (dtb_image.segment[dtb_image.segments].file == NULL) {
+				goto fail;
+			}
+			if (file_size != segment.file_size) {
+				printf("adsp: %u: fw/%s has %llu bytes, the header says %u\n", step, name, file_size,
+				    segment.file_size);
+				dtb_image.segments++;
+				goto fail;
+			}
+			files += file_size;
+		}
+		dtb_image.segment[dtb_image.segments].at = 0;
+		dtb_image.segment[dtb_image.segments].paddr = segment.paddr;
+		dtb_image.segment[dtb_image.segments].file_size = segment.file_size;
+		dtb_image.segment[dtb_image.segments].memory_size = segment.memory_size;
+		if (segment.paddr < lowest) {
+			lowest = segment.paddr;
+		}
+		if (segment.paddr + segment.memory_size > highest) {
+			highest = segment.paddr + segment.memory_size;
+		}
+		dtb_image.segments++;
+	}
+	if (dtb_image.segments == 0 || lowest == ~0u || 52 + 32 * count + (uint64_t)hashes != size) {
+		printf("adsp: %u: the DTB is not what TrustZone takes: %u segments, the header file has %llu bytes\n", step,
+		    dtb_image.segments, size);
+		goto fail;
+	}
+	if ((uint64_t)highest - lowest > ADSP_DTB_MEMORY_SIZE) {
+		printf("adsp: %u: the DTB spans %#llx bytes, its reserved memory is %#x\n", step,
+		    (uint64_t)highest - lowest, ADSP_DTB_MEMORY_SIZE);
+		goto fail;
+	}
+	dtb_image.size = ((highest + 0xfff) & ~0xfffu) - lowest;
+	if (dtb_image.size > ADSP_DTB_MEMORY_SIZE) {
+		printf("adsp: %u: the DTB spans %#x bytes when rounded to a page, its reserved memory is %#x\n", step,
+		    dtb_image.size, ADSP_DTB_MEMORY_SIZE);
+		goto fail;
+	}
+	for (unsigned s = 0; s < dtb_image.segments; s++) {
+		dtb_image.segment[s].at = dtb_image.segment[s].paddr - lowest;
+	}
+	printf("adsp: %u: the DTB is whole: a header of %llu bytes (%u of hashes), %u segments, %llu bytes of files, %#x "
+	    "bytes from %#x\n", step, size, hashes, dtb_image.segments, files, dtb_image.size, lowest);
+
+	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		printf("adsp: %u: no memory for the DTB's header\n", step);
+		goto fail;
+	}
+	memcpy((void *)page, header, dtb_image.header_size);
+	for (vm_offset_t line = page; line < page + PAGE_SIZE; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	settle();
+	result = scm("to take the audio DSP's DTB header", SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_ADSP_DTB,
+	    kvtophys(page), 0, &answer);
+	if (result != 0 || answer != 0) {
+		printf("adsp: %u: TRUSTZONE DOES NOT TAKE THE DTB HEADER: the call returns %d, its answer is %#llx\n", step,
+		    result, answer);
+		goto fail;
+	}
+	result = scm("where the audio DSP's DTB will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_ADSP_DTB,
+	    ADSP_DTB_MEMORY, dtb_image.size, &answer);
+	if (result != 0 || answer != 0) {
+		printf("adsp: %u: TRUSTZONE DOES NOT TAKE THE DTB'S PLACE: the call returns %d, its answer is %#llx\n", step,
+		    result, answer);
+		goto fail;
+	}
+	memory = (uint8_t *)ml_io_map_unmappable(ADSP_DTB_MEMORY, ADSP_DTB_MEMORY_SIZE, VM_WIMG_WCOMB);
+	if (memory == NULL) {
+		printf("adsp: %u: no mapping for the DTB's memory at %#x\n", step, ADSP_DTB_MEMORY);
+		goto fail;
+	}
+	memset(memory, 0, dtb_image.size);
+	for (unsigned s = 0; s < dtb_image.segments; s++) {
+		memcpy(memory + dtb_image.segment[s].at, dtb_image.segment[s].file, dtb_image.segment[s].file_size);
+	}
+	settle();
+	result = scm("to authenticate the audio DSP's DTB and start it", SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE,
+	    PAS_ADSP_DTB, 0, 0, &answer);
+	if (result != 0 || answer != 0) {
+		printf("adsp: %u: TRUSTZONE DOES NOT START THE DTB: the call returns %d, its answer is %#llx\n", step, result,
+		    answer);
+		goto fail;
+	}
+	dtb_started = true;
+	printf("adsp: %u: THE AUDIO DSP'S DTB IS STARTED: %#x bytes at %#x\n", step, dtb_image.size, ADSP_DTB_MEMORY);
+	ok = true;
+fail:
+	dtb_forget();
+	return ok;
+}
+
 /* Asked to stop, then shut down by TrustZone, then the always-on processor told that the image is gone. */
 static bool
 dsp_shutdown(const char *why)
@@ -1388,6 +1630,18 @@ dsp_shutdown(const char *why)
 		return false;
 	}
 	printf("adsp: %u: THE AUDIO DSP IS SHUT DOWN\n", step);
+	if (dtb_started) {
+		answer = ~0ull;
+		result = scm("to shut the audio DSP's DTB down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_ADSP_DTB, 0, 0,
+		    &answer);
+		if (result != 0 || answer != 0) {
+			printf("adsp: %u: TRUSTZONE DOES NOT SHUT THE DTB DOWN: the call returns %d, its answer is %#llx\n", step,
+			    result, answer);
+		} else {
+			printf("adsp: %u: THE AUDIO DSP'S DTB IS SHUT DOWN\n", step);
+			dtb_started = false;
+		}
+	}
 	need(&ipcc);
 	wr(ipcc.base + IPCC_DISABLE, IPCC_LPASS << 16 | IPCC_SMP2P);
 	doorbells();
@@ -1426,6 +1680,11 @@ step_header(void)
 		}
 	} else {
 		printf("adsp: %u: the DSP has left nothing in the shared memory: it has not run since the phone was started\n", step);
+	}
+
+	announce("load the audio DSP's device tree through its own PAS channel (0x24)");
+	if (!dtb_load()) {
+		return false;
 	}
 
 	announce("hand the image's header to TrustZone to check its signature (image 1), in a page of ours");
@@ -1486,12 +1745,12 @@ step_image(void)
 	for (unsigned s = 0; s < image.segments; s++) {
 		volatile uint64_t *to = dsp_memory + image.segment[s].at / 8;
 
-		if ((image.segment[s].at | image.segment[s].memory_size) & 7) {
-			printf("adsp: %u: a segment that does not begin and end at a multiple of eight bytes: not written\n", step);
+		if (image.segment[s].at & 7) {
+			printf("adsp: %u: a segment that does not begin at a multiple of eight bytes: not written\n", step);
 			ml_io_unmap((vm_offset_t)dsp_memory, ADSP_MEMORY_SIZE);
 			return false;
 		}
-		for (uint32_t i = 0; i < image.segment[s].memory_size; i += 8) {
+		for (uint32_t i = 0; i < ((image.segment[s].memory_size + 7) & ~7u); i += 8) {
 			to[i / 8] = segment_word(s, i);
 		}
 		written += image.segment[s].file_size;
@@ -1501,7 +1760,7 @@ step_image(void)
 	for (unsigned s = 0; s < image.segments; s++) {
 		volatile uint64_t *from = dsp_memory + image.segment[s].at / 8;
 
-		for (uint32_t i = 0; i < image.segment[s].memory_size; i += 8) {
+		for (uint32_t i = 0; i < ((image.segment[s].memory_size + 7) & ~7u); i += 8) {
 			wrong += from[i / 8] != segment_word(s, i);
 		}
 	}
@@ -1685,10 +1944,8 @@ step_start(void)
 	}
 	rails_asked = true;
 	if (!mailbox_send("{class: image, res: load_state, name: adsp, val: on}")) {
-		rails(0);
-		rails_asked = false;
-		lck_mtx_unlock(&dsp_lock);
-		return false;
+		/* peridot's always-on processor does not always take this; it is not what starts the DSP */
+		printf("adsp: %u: THE ALWAYS-ON PROCESSOR DOES NOT TAKE THE IMAGE'S STATE: carrying on to TrustZone\n", step);
 	}
 	result = scm("to authenticate the audio DSP's image and start it", SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_ADSP, 0, 0,
 	    &answer);
@@ -1883,7 +2140,6 @@ glink_find(void)
 	uint32_t size = 0;
 
 	glink.descriptor = smem_item(ITEM_GLINK_DESCRIPTOR, &size);
-	/* (the descriptor and both queues are read and written without further checks: all three must lie inside the SMEM window) */
 	if (glink.descriptor == 0 || size != 32 || (uint64_t)glink.descriptor + size > SMEM_SIZE) {
 		return false;
 	}
@@ -1899,7 +2155,6 @@ glink_reset(void)
 {
 	uint32_t size = 0, descriptor = smem_item(ITEM_GLINK_DESCRIPTOR, &size);
 
-	/* (and inside the SMEM window: the words below are read and written without a bounds check) */
 	if (descriptor == 0 || size != 32 || (uint64_t)descriptor + size > SMEM_SIZE) {
 		printf("adsp: %u: GLINK's descriptor (item %u) is not there: nothing to reset\n", step, ITEM_GLINK_DESCRIPTOR);
 		return;
@@ -2008,7 +2263,6 @@ glink_offer(struct glink_channel *channel, uint32_t size)
 		return false;
 	}
 	if (channel->our_intents[i].data == NULL || channel->our_intents[i].size != size) {
-		/* (a buffer of another size from an earlier run is given back first: replacing the pointer would leak it) */
 		if (channel->our_intents[i].data != NULL) {
 			kfree_data(channel->our_intents[i].data, channel->our_intents[i].size);
 			channel->our_intents[i].data = NULL;
@@ -2036,10 +2290,6 @@ glink_pump(void)
 
 	while (glink.up && !glink.broken) {
 		uint32_t waiting = glink_waiting(), length;
-		/*
-		 * The length is worked out in 64 bits: the DSP writes the fields it comes from, and in 32 bits a value such as
-		 * 0xfffffff8 wrapped it to 0, so that the message was never taken out and this loop never ended (with glink_lock held).
-		 */
 		uint64_t wide = sizeof(message);
 
 		if (waiting < sizeof(message)) {
@@ -2327,6 +2577,56 @@ static struct {
 	bool there;
 } qrtr_servers[64];
 static uint32_t qrtr_peer, qrtr_in, qrtr_out, qrtr_hellos, qrtr_lookups;
+/* what the DSP looked for on our side (the first 16): what it is waiting for before it starts more */
+static struct {
+	uint32_t service, instance;
+} qrtr_wanted[16];
+
+/*
+ * The names of the QMI services that matter for what comes next (the numbers are the ones every
+ * Qualcomm client uses; Linux has them as constants beside each client): the sensors' own service is
+ * how a sensor client would speak to the DSP's sensor framework, and it only appears once the DSP's
+ * sensor protection domain has started -- which waits for the service locator and notifier it looks
+ * for on our side. kern.hakios.adsp_services tells, on the phone, which of these there are.
+ */
+static const char *
+qrtr_service_name(uint32_t service)
+{
+	switch (service) {
+	case 16: return "location (LOC)";
+	case 43: return "subsystem control (SSCTL)";
+	case 64: return "service locator (SERVREG_LOC)";
+	case 66: return "service notifier (SERVREG_NOTIF)";
+	case 69: return "Wi-Fi firmware (WLFW)";
+	case 400: return "sensors (SNS client, SEE)";
+	default: return "";
+	}
+}
+
+static int
+adsp_services_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	static char text[4096];
+	size_t n = 0;
+
+	n += snprintf(text + n, sizeof(text) - n, "offered by the DSP:\n");
+	for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]) && n < sizeof(text); i++) {
+		if (qrtr_servers[i].there) {
+			n += snprintf(text + n, sizeof(text) - n, "  %u version %u instance %u at %u:%u %s\n", qrtr_servers[i].service,
+			    qrtr_servers[i].instance & 0xff, qrtr_servers[i].instance >> 8, qrtr_servers[i].node, qrtr_servers[i].port,
+			    qrtr_service_name(qrtr_servers[i].service));
+		}
+	}
+	n += snprintf(text + n, sizeof(text) - n, n < sizeof(text) ? "looked for by the DSP on our side (%u times):\n" : "", qrtr_lookups);
+	for (unsigned i = 0; i < sizeof(qrtr_wanted) / sizeof(qrtr_wanted[0]) && i < qrtr_lookups && n < sizeof(text); i++) {
+		n += snprintf(text + n, sizeof(text) - n, "  %u instance %u %s\n", qrtr_wanted[i].service, qrtr_wanted[i].instance,
+		    qrtr_service_name(qrtr_wanted[i].service));
+	}
+	return SYSCTL_OUT(req, text, strlen(text) + 1);
+}
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_PROC(_kern_hakios, OID_AUTO, adsp_services, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
+    adsp_services_sysctl, "A", "the QMI services the audio DSP offers, and those it looks for on our side");
 
 static int
 qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to_port, const void *data, uint32_t length)
@@ -2397,6 +2697,10 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
 		break;
 	case QRTR_NEW_LOOKUP:
 		/* the DSP looks for a service of ours (a protection domain's locator, say): there are none yet */
+		if (qrtr_lookups < sizeof(qrtr_wanted) / sizeof(qrtr_wanted[0])) {
+			qrtr_wanted[qrtr_lookups].service = control->words[0];
+			qrtr_wanted[qrtr_lookups].instance = control->words[1];
+		}
 		if (qrtr_lookups++ < 16) {
 			printf("adsp: qrtr: the DSP looks for service %u (%#x), instance %u: nobody here offers it\n", control->words[0],
 			    control->words[0], control->words[1]);
@@ -2436,7 +2740,6 @@ qrtr_input(const uint8_t *data, uint32_t length)
 		printf("adsp: qrtr: %u bytes that are no datagram (they begin %#x)\n", length, length ? data[0] : 0);
 		return;
 	}
-	/* (the datagram's size is the DSP's word: "at + size" could wrap in 32 bits and pass, so it is compared as a difference) */
 	if (header.size == 0 || at > length || header.size > length - at) {
 		printf("adsp: qrtr: a datagram of %u bytes in a message of %u: dropped\n", header.size, length);
 		return;
@@ -2525,13 +2828,8 @@ apr_input(const uint8_t *data, uint32_t length)
 		printf("adsp: apr: a header of %u bytes in a packet of %u: dropped\n", header_length, length);
 		return;
 	}
-	/*
-	 * The packet's own size is the DSP's word: below the header it would make the payload wrap to about 4 GB, and the copies
-	 * below would then read 256 bytes from beyond this packet. Such a packet is dropped.
-	 */
 	if ((header.size < length ? header.size : length) < header_length) {
-		printf("adsp: apr: a packet of %u bytes with a header of %u: dropped\n", header.size < length ? header.size : length,
-		    header_length);
+		printf("adsp: apr: a packet of %u bytes with a header of %u: dropped\n", header.size < length ? header.size : length, header_length);
 		return;
 	}
 	payload = (header.size < length ? header.size : length) - header_length;
@@ -2565,7 +2863,6 @@ apr_input(const uint8_t *data, uint32_t length)
 	apr_answer.length = payload;
 	apr_answer.opcode = header.opcode;
 	apr_answer.token = header.token;
-	/* (released: the thread that waits must not see "there" before the words and the token above, as with battmgr's answers) */
 	os_atomic_store(&apr_answer.there, true, release);
 }
 
@@ -2671,8 +2968,8 @@ apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, 
  * that a get does not use, and is answered with the property's number, its value and a result (0:
  * good). Only gets are sent from here: nothing is set, no limit, no current, no notice asked for.
  * With adsp=1 (battmgr=0: not) it is asked every BATTMGR_SECONDS while the DSP runs, and what it says
- * goes to drivers/power/hakios.battery.c (hakios_battery_report()), and from there to the power source
- * that Darwin reads (drivers/power/hakios.battery.cpp). battmgr=2: every property once, for the log.
+ * goes to bsd/dev/hakios.battery.c (hakios_battery_report()), and from there to the power source
+ * that iOS reads (iokit/Kernel/hakios.battery.cpp). battmgr=2: every property once, for the log.
  * Units: capacity in hundredths of a percent, voltage in uV, current in uA (more than 0 while the
  * battery takes charge), the temperature in hundredths of a degree, charges in uAh.
  * The properties' numbers are this phone's firmware's, read with battmgr=2 and checked against what
@@ -2702,6 +2999,29 @@ apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, 
 #define USB_TYPE                6               /* Linux's POWER_SUPPLY_USB_TYPE_*: 1 here, a computer's port */
 #define USB_ONLINE              0
 #define BATTMGR_SECONDS         10
+/*
+ * What Android's qti_battery_charger.c does besides asking (Xiaomi's kernel for this phone, GPL): it asks the
+ * DSP for its notices once the channel is up (BC_SET_NOTIFY_REQ, a notice-type message of four zero words),
+ * and it reads Xiaomi's own properties of the charger with opcode 0x50 (BC_XM_STATUS_GET), numbered as that
+ * kernel's enum xm_property_id with this phone's configuration (CONFIG_REDWOOD_FOR_BUILD, CONFIG_BQ2597X,
+ * CONFIG_BQ_CLOUD_AUTHENTICATION) leaves them. battmgr=3 asks for every one of the 115 once, for the log, to
+ * hold the numbers against what Android shows in /sys/class/qcom-battery. Nothing is set from here.
+ */
+#define BATTMGR_SET_NOTIFY      0x04
+#define BATTMGR_XM_GET          0x50
+#define BATTMGR_XM_PROPS        115
+#define USB_CURR_MAX            4               /* uA */
+#define USB_INPUT_CURR_LIMIT    5               /* uA */
+#define USB_REAL_TYPE           11
+#define XM_COOL_MODE            20
+#define XM_INPUT_SUSPEND        45
+#define XM_REAL_TYPE            46
+#define XM_FASTCHGMODE          63
+#define XM_THERMAL_REMOVE       65
+#define XM_NIGHT_CHARGING       77
+#define XM_SMART_BATT           78
+#define XM_FG1_SOH              82
+#define XM_FG1_TAMBIENT         89
 
 struct battmgr_message {
 	uint32_t owner, type, opcode;
@@ -2714,6 +3034,22 @@ static struct {
 	bool wanted;
 	volatile bool runs;
 } battmgr;
+
+/* the charger as the DSP and Xiaomi's properties describe it, for kern.hakios.charger */
+static char battmgr_charger[768] = "charger: not asked yet (adsp=1, and the DSP's battery manager up)\n";
+
+static int
+battmgr_charger_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	static char copy[sizeof(battmgr_charger)];
+
+	memcpy(copy, battmgr_charger, sizeof(copy));
+	copy[sizeof(copy) - 1] = 0;
+	return SYSCTL_OUT(req, copy, strlen(copy) + 1);
+}
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_PROC(_kern_hakios, OID_AUTO, charger, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
+    battmgr_charger_sysctl, "A", "the charger, as the audio DSP's battery manager and Xiaomi's properties say");
 
 static void
 battmgr_input(const uint8_t *data, uint32_t length)
@@ -2769,6 +3105,71 @@ battmgr_get(uint32_t opcode, uint32_t property, uint32_t *value)
 	return false;
 }
 
+/* the DSP's notices asked for, as Android does once its battery manager's channel is up */
+static void
+battmgr_notify_enable(void)
+{
+	struct {
+		uint32_t owner, type, opcode;
+		uint32_t battery, power_state, low_capacity, high_capacity;
+	} q = { BATTMGR_OWNER, BATTMGR_NOTICE, BATTMGR_SET_NOTIFY, 0, 0, 0, 0 };
+	uint32_t on = 1;
+
+	PE_parse_boot_argn("battmgr_notify", &on, sizeof(on));
+	if (PE_parse_boot_argn("battmgr_xm", &on, sizeof(on)) && on == 0) {
+		return;
+	}
+	if (on == 0) {
+		return;
+	}
+	tell("adsp: battmgr: the DSP's notices asked for (BC_SET_NOTIFY_REQ, as Android does): %s\n",
+	    glink_send(&glink.channel[CHANNEL_PMIC], &q, sizeof(q)) == 0 ? "sent" : "NOT SENT");
+}
+
+/* the charger's state, Xiaomi's properties among it, into kern.hakios.charger (and the log when it changes) */
+static void
+battmgr_charger_look(uint32_t usb)
+{
+	uint32_t xm = 1;
+
+	/* battmgr_xm=0: the battery alone, as before the charger's own story was asked for */
+	if (PE_parse_boot_argn("battmgr_xm", &xm, sizeof(xm)) && xm == 0) {
+		return;
+	}
+	static const struct { uint32_t opcode, property; const char *name; } asked[] = {
+		{ BATTMGR_USB_GET, USB_CURR_MAX, "usb_current_max_ua" },
+		{ BATTMGR_USB_GET, USB_INPUT_CURR_LIMIT, "usb_input_limit_ua" },
+		{ BATTMGR_USB_GET, USB_REAL_TYPE, "usb_real_type" },
+		{ BATTMGR_XM_GET, XM_INPUT_SUSPEND, "input_suspend" },
+		{ BATTMGR_XM_GET, XM_REAL_TYPE, "xm_real_type" },
+		{ BATTMGR_XM_GET, XM_FASTCHGMODE, "fastchg_mode" },
+		{ BATTMGR_XM_GET, XM_THERMAL_REMOVE, "thermal_remove" },
+		{ BATTMGR_XM_GET, XM_COOL_MODE, "cool_mode" },
+		{ BATTMGR_XM_GET, XM_NIGHT_CHARGING, "night_charging" },
+		{ BATTMGR_XM_GET, XM_SMART_BATT, "smart_batt" },
+		{ BATTMGR_XM_GET, XM_FG1_SOH, "soh_percent" },
+		{ BATTMGR_XM_GET, XM_FG1_TAMBIENT, "fg_ambient" },
+	};
+	static char text[sizeof(battmgr_charger)];
+	size_t n = 0;
+
+	n += snprintf(text + n, sizeof(text) - n, "usb_online %u\n", usb);
+	for (unsigned i = 0; i < sizeof(asked) / sizeof(asked[0]) && n < sizeof(text); i++) {
+		uint32_t v = 0;
+
+		if (battmgr_get(asked[i].opcode, asked[i].property, &v)) {
+			n += snprintf(text + n, sizeof(text) - n, "%s %d\n", asked[i].name, (int)v);
+		} else {
+			n += snprintf(text + n, sizeof(text) - n, "%s -\n", asked[i].name);
+		}
+	}
+	if (strcmp(text, battmgr_charger) != 0) {
+		memcpy(battmgr_charger, text, sizeof(battmgr_charger));
+		battmgr_charger[sizeof(battmgr_charger) - 1] = 0;
+		tell("adsp: battmgr: the charger now:\n%s", battmgr_charger);
+	}
+}
+
 static void
 battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -2786,6 +3187,14 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 		uint32_t mode = 1;
 
 		PE_parse_boot_argn("battmgr", &mode, sizeof(mode));
+		battmgr_notify_enable();
+		/* battmgr=3: every one of Xiaomi's properties once (opcode 0x50) */
+		for (uint32_t p = 0; mode == 3 && p < BATTMGR_XM_PROPS; p++) {
+			uint32_t v = 0;
+			bool ok = battmgr_get(BATTMGR_XM_GET, p, &v);
+
+			tell("adsp: battmgr: xiaomi property %u: %s %u (%d)\n", p, ok ? "" : "NO ANSWER", v, (int)v);
+		}
 		for (uint32_t p = 0; mode == 2 && p < 32; p++) {
 			uint32_t v = 0;
 			bool ok = battmgr_get(BATTMGR_BATTERY_GET, p, &v);
@@ -2840,6 +3249,15 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 			b.usb_voltage_uv = (int32_t)usb_volt;
 			b.usb_current_ua = (int32_t)usb_curr;
 			hakios_battery_report(&b);
+			/* the charger's own story: at the start, whenever the cable comes or goes, and every minute */
+			{
+				static uint32_t usb_before = 0xffffffff;
+
+				if (round % 6 == 0 || usb != usb_before) {
+					battmgr_charger_look(usb);
+					usb_before = usb;
+				}
+			}
 		}
 		if (round < 3 || round % 6 == 0 || !good) {
 			tell("adsp: battmgr: %s capacity %u (hundredths of a percent), status %u, present %u, %d uV, %d uA, temperature %d "
@@ -2972,10 +3390,6 @@ link_stop(void)
 			kfree_data(packet, sizeof(*packet) + packet->length);
 		}
 		channel->last = NULL;
-		/*
-		 * The buffers we offered the DSP are given back too, so that they do not stay allocated for good: only
-		 * glink_pump() uses them, under this lock, and it does nothing while glink.up is false.
-		 */
 		for (unsigned i = 0; i < sizeof(channel->our_intents) / sizeof(channel->our_intents[0]); i++) {
 			if (channel->our_intents[i].data != NULL) {
 				kfree_data(channel->our_intents[i].data, channel->our_intents[i].size);
@@ -3257,7 +3671,7 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 	thread_terminate(current_thread());
 }
 
-/* Called while the system starts (drivers/input/hakios.input.c), after the Wi-Fi's start has been set going. */
+/* Called while the system starts (bsd/dev/hakios.input.c), after the Wi-Fi's start has been set going. */
 void
 hakios_adsp_init(void)
 {
@@ -3265,8 +3679,13 @@ hakios_adsp_init(void)
 	thread_t thread;
 
 	PE_parse_boot_argn("adsp_step", &last_step, sizeof(last_step));
-	if (last_step == 0 && (!PE_parse_boot_argn("adsp", &on, sizeof(on)) || on != 1)) {
-		return;
+	if (last_step == 0) {
+		if (!PE_parse_boot_argn("adsp", &on, sizeof(on))) {
+			on = 1;         /* peridot: audio comes up by default; adsp=0 turns it off */
+		}
+		if (on != 1) {
+			return;
+		}
 	}
 	if (pe_arm_get_soc_base_phys() != HAKIOS_SOC_BASE) {
 		printf("adsp: adsp=1 and adsp_step=N are for the phone's audio DSP, and this is not the phone\n");

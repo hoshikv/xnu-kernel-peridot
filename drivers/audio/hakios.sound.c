@@ -76,6 +76,7 @@
 #include <libkern/OSAtomic.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
+#include <pexpert/device_tree.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
 #include <sys/hakios.audio.h>
@@ -1494,12 +1495,30 @@ out:
 	thread_terminate(current_thread());
 }
 
+static bool
+sound_board_is_peridot(void)
+{
+	DTEntry entry;
+	void const *prop;
+	unsigned int size;
+
+	return SecureDTLookupEntry(NULL, "/arm-io", &entry) == kSuccess &&
+	    SecureDTGetProperty(entry, "device_type", &prop, &size) == kSuccess &&
+	    size >= 7 && memcmp(prop, "peridot", 7) == 0;
+}
+
 void
 hakios_sound_dsp_up(void)
 {
 	thread_t thread;
 
-	if (!PE_parse_boot_argn("sound", &level, sizeof(level)) || level == 0) {
+	if (!PE_parse_boot_argn("sound", &level, sizeof(level))) {
+		if (!sound_board_is_peridot()) {
+			return;
+		}
+		level = 4;
+	}
+	if (level == 0) {
 		return;
 	}
 	if (level > 4) {

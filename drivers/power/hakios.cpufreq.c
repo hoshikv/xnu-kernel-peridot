@@ -19,6 +19,7 @@
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <sys/hakios.input.h>
+#include <sys/hakios.board.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
 
@@ -54,7 +55,7 @@ tell(const char *format, ...)
 	}
 }
 
-#define EPSS_PHYS               0x18591000UL    /* three groups ("domains") of 0x1000: small cores, big, biggest */
+#define EPSS_PHYS               hakios_board_addr("epss", 0x18591000UL)    /* three groups ("domains") of 0x1000: small cores, big, biggest */
 #define EPSS_DOMAIN_SIZE        0x1000UL
 #define EPSS_DOMAINS            3
 #define EPSS_FREQ_TABLE         0x100           /* a word per row: [31:30] clock source, [7:0] multiple of 19.2 MHz */
@@ -77,14 +78,29 @@ loop_speed(void)
 	return nanos ? (uint32_t)(2000000ULL * 1000 / nanos) : 0;
 }
 
-/* The group of the core with that number in its MPIDR (the device tree's "reg": the number is the second field). */
+/*
+ * The group of the core with that number in its MPIDR (the device tree's "reg": the number is the
+ * second field). The small cores are the profile's bitmask (Peridot: 0x07, cores 0..2; redwood:
+ * 0x0f, cores 0..3), the prime core is the profile's number (both: 7), and every other core is in
+ * the big group.
+ */
+static uint32_t small_cores = 0x0f;
+static uint32_t prime_core = 7;
+
 static uint32_t
 domain_of(uint32_t phys_id)
 {
 	uint32_t core = (phys_id >> 8) & 0xff;
 
-	return core < 4 ? 0 : core < 7 ? 1 : 2;
+	if (core < 32 && (small_cores & (1u << core)) != 0) {
+		return 0;
+	}
+	return core == prime_core ? 2 : 1;
 }
+
+static vm_offset_t epss_base[EPSS_DOMAINS];
+static int epss_top[EPSS_DOMAINS] = { -1, -1, -1 };
+static uint32_t epss_khz[EPSS_DOMAINS][EPSS_TABLE_ROWS];
 
 static void
 raise_domain(uint32_t domain, uint32_t cores)
@@ -102,12 +118,45 @@ raise_domain(uint32_t domain, uint32_t cores)
 		}
 		top = row;
 		top_khz = khz;
+		epss_khz[domain][row] = khz;
 	}
+	epss_base[domain] = base;
+	epss_top[domain] = (int)top;
 	was = *(volatile uint32_t *)(base + EPSS_PERF_STATE);
 	*(volatile uint32_t *)(base + EPSS_PERF_STATE) = top;
 	delay_for_interval(20, NSEC_PER_MSEC);
 	tell("cpufreq: group %u (%u of our cores): row %u -> %u of the frequency table, %u MHz\n", domain, cores, was, top,
 	    top_khz / 1000);
+}
+
+int
+hakios_cpufreq_top(uint32_t domain)
+{
+	return domain < EPSS_DOMAINS ? epss_top[domain] : -1;
+}
+
+uint32_t
+hakios_cpufreq_khz(uint32_t domain, int row)
+{
+	if (domain >= EPSS_DOMAINS || row < 0 || row > epss_top[domain]) {
+		return 0;
+	}
+	return epss_khz[domain][row];
+}
+
+void
+hakios_cpufreq_cap(uint32_t domain, int row)
+{
+	if (domain >= EPSS_DOMAINS || epss_top[domain] < 0) {
+		return;
+	}
+	if (row < 0) {
+		row = 0;
+	}
+	if (row > epss_top[domain]) {
+		row = epss_top[domain];
+	}
+	*(volatile uint32_t *)(epss_base[domain] + EPSS_PERF_STATE) = (uint32_t)row;
 }
 
 /*
@@ -306,7 +355,7 @@ load_start(void)
  * left, with what is needed to vote for bandwidth on them -- only read. (membench=2 says the cores
  * together get no more from memory than one alone: 12 GB/s; nobody here votes for more.)
  */
-#define CMD_DB_PHYS             0x80860000UL
+#define CMD_DB_PHYS             hakios_board_addr("cmd_db", 0x80860000UL)
 #define CMD_DB_SIZE             0x20000UL
 #define CMD_DB_BCM              5               /* the kind of resource in a slave's id: bus clock managers */
 
@@ -380,7 +429,7 @@ ddr_look(void)
  * each (sc7280's qcom,tcs-config): every command with an address, and which of them go to the BCMs
  * above -- the bandwidth it asked for, and that is in force whenever the processors are awake.
  */
-#define RSC_PHYS                0x18220000UL
+#define RSC_PHYS                hakios_board_addr("rsc", 0x18220000UL)
 #define RSC_SIZE                0x10000UL
 #define RSC_TCS(n, reg)         (0xd00 + 0x2a0 * (n) + (reg))
 #define RSC_TCS_COUNT           9
@@ -575,6 +624,9 @@ hakios_cpufreq_init(void)
 	if (!PE_parse_boot_argn("cpufreq", &enabled, sizeof(enabled)) || !enabled) {
 		return;
 	}
+	small_cores = hakios_board_number("small_cores", small_cores);
+	prime_core = hakios_board_number("prime_core", prime_core);
+	tell("cpufreq: small-core mask %#x, prime core %u\n", small_cores, prime_core);
 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
 		cores[domain_of(topology->cpus[i].phys_id)]++;
 	}

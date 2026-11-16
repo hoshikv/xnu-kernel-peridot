@@ -41,6 +41,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/hakios.input.h>
+#include <sys/hakios.wifi.h>
 #include <sys/hakios.qmi.h>
 #include <sys/systm.h>
 
@@ -477,7 +478,7 @@ hakios_wlfw_exchange(uint32_t step)
 	 * and fall back to "board.bin"; here it is the file this phone's Android sends.
 	 */
 	send_file("the regulatory database", "regdb_xiaomi.bin", ATH11K_QMI_BDF_TYPE_REGDB, board_id);
-	board = send_file("the board's data", "bd_m20gl.elf", ATH11K_QMI_BDF_TYPE_ELF, board_id);
+	board = send_file("the board's data", hakios_wifi_board_data_file(), ATH11K_QMI_BDF_TYPE_ELF, board_id);
 	if (!board) {
 		goto out;
 	}

@@ -165,6 +165,8 @@
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/hakios.input.h>
+#include <sys/hakios.board.h>
+#include <sys/hakios.wifi.h>
 #include <sys/hakios.qrtr.h>
 #include <sys/hakios.sta.h>
 #include <sys/stat.h>
@@ -447,7 +449,7 @@ put(struct block *b, const char *name, uint32_t offset, uint32_t value)
  * how long. Who is who: we are processor 0; the Wi-Fi DSP is 13 (dt: qcom,remote-pid of
  * qcom,smp2p-wpss). Nothing here writes to this memory.
  */
-#define SMEM_PHYS               0x80900000UL
+#define SMEM_PHYS               hakios_board_addr("smem", 0x80900000UL)
 #define SMEM_SIZE               0x00200000u
 #define SMEM_US                 0
 #define SMEM_WPSS               13
@@ -889,7 +891,7 @@ step_mailbox(void)
 /* ---- step 3: RPMh -------------------------------------------------------------------------------------- */
 
 /* dt: reserved-memory cmd_db@80860000: the boot loader's list of what RPMh can switch (cmd-db.c; as in hakios.adreno.c) */
-#define CMD_DB_PHYS             0x80860000UL
+#define CMD_DB_PHYS             hakios_board_addr("cmd_db", 0x80860000UL)
 #define CMD_DB_SIZE             0x20000UL
 
 struct cmd_db_slave {
@@ -1012,20 +1014,23 @@ static struct block rsc = { "rsc", 0x18220000, 0x10000 };
 static bool
 step_rpmh(void)
 {
-	static const char *const kinds[] = { "at once", "at once", "asleep", "asleep", "asleep", "awake", "awake", "awake" };
+	char cx[16], xo[16], rfa[16];
 	uint32_t id, config, count, commands;
 
-	announce("look up the supplies involved in the boot loader's list of RPMh resources (memory at 0x80860000)");
+	announce("look up the supplies involved in the boot loader's list of RPMh resources");
 	if (!cmd_db_there()) {
 		printf("wifi: %u: the list is not there\n", step);
 		return false;
 	}
+	hakios_board_text("wifi_rail_cx", "smpb7", cx, sizeof(cx));
+	hakios_board_text("wifi_rail_xo", "smpb1", xo, sizeof(xo));
+	hakios_board_text("wifi_rail_rfa", "smpb8", rfa, sizeof(rfa));
 	show_rpmh_resource("cx.lvl", "the DSP's logic; dt: vdd_cx of qcom,wpss@8a00000, asked 384 while it boots");
 	show_rpmh_resource("mx.lvl", "its memories; dt: vdd_mx, the same");
 	show_rpmh_resource("xo.lvl", "the crystal oscillator; dt: its clock \"xo\"");
-	show_rpmh_resource("smpb7", "PM7325 S7: the radio's vdd-cx-mx");
-	show_rpmh_resource("smpb1", "PM7325 S1: the radio's vdd-1.8-xo");
-	show_rpmh_resource("smpb8", "PM7325 S8: the radio's vdd-1.3-rfa");
+	show_rpmh_resource(cx, "the radio's vdd-cx-mx");
+	show_rpmh_resource(xo, "the radio's vdd-1.8-xo");
+	show_rpmh_resource(rfa, "the radio's vdd-1.3-rfa");
 
 	announce("read the application processor's RPMh sequencer (0x18220000: the first access to that block): its version, "
 	    "and the commands its slots hold");
@@ -1041,7 +1046,7 @@ step_rpmh(void)
 	for (uint32_t t = 0; t < count && t < 8; t++) {
 		uint32_t enabled = rd(rsc.base + RSC_TCS(t) + TCS_ENABLED);
 
-		printf("wifi: %u: TCS %u (%s): commands enabled %#x, control %#x, status %#x\n", step, t, kinds[t], enabled,
+		printf("wifi: %u: TCS %u: commands enabled %#x, control %#x, status %#x\n", step, t, enabled,
 		    rd(rsc.base + RSC_TCS(t) + TCS_CONTROL), rd(rsc.base + RSC_TCS(t) + TCS_STATUS));
 		for (uint32_t c = 0; c < commands && c < 16; c++) {
 			uint32_t flags = rd(rsc.base + RSC_TCS(t) + TCS_COMMAND(c));
@@ -1157,10 +1162,12 @@ spmi_read(int channel, uint8_t reg, uint8_t *bytes, uint32_t count)
 static bool
 step_rails(void)
 {
+	char pmic1[16], pmic2[16];
 	uint32_t version;
 
-	announce("map the PMIC arbiter (0xc440000, 0xc40a000, 0xe600000; the buttons' driver reads through it too) and read "
-	    "its version");
+	hakios_board_text("wifi_pmic1", "PM7325", pmic1, sizeof(pmic1));
+	hakios_board_text("wifi_pmic2", "PM8350C", pmic2, sizeof(pmic2));
+	announce("map the PMIC arbiter (the buttons' driver reads through it too) and read its version");
 	version = get(&arb_core, "version", ARB_VERSION);
 	arb_channels = get(&arb_core, "features", ARB_FEATURES) & 0x7ff;
 	need(&arb_cnfg);
@@ -1198,7 +1205,7 @@ step_rails(void)
 				    types[peripheral][1]);
 			}
 			if (at > 0 && (at > (int)sizeof(line) - 80 || peripheral == 255)) {
-				printf("wifi: %u: slave %u (%s), peripheral:type/subtype:%s\n", step, slave, slave == 1 ? "PM7325" : "PM8350C",
+				printf("wifi: %u: slave %u (%s), peripheral:type/subtype:%s\n", step, slave, slave == 1 ? pmic1 : pmic2,
 				    line);
 				at = 0;
 			}
@@ -1245,18 +1252,21 @@ step_rails(void)
  * an external abort, which ends the kernel. They are TrustZone's; the device tree gives the
  * loader's node the crystal alone.)
  */
-#define FIRST_PIN               84
-static struct block tlmm = { "tlmm", 0x0f100000 + 0x1000 * FIRST_PIN, 0x3000 };        /* the three pins' registers */
-#define GPIO_CFG(n)             (0x1000 * ((n) - FIRST_PIN))            /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
-#define GPIO_IO(n)              (0x1000 * ((n) - FIRST_PIN) + 4)        /* bit 0 in, bit 1 out */
+static struct block tlmm = { "tlmm", 0x0f100000, 0x00100000 };
+#define GPIO_CFG(n)             (0x1000 * (n))
+#define GPIO_IO(n)              (0x1000 * (n) + 4)
 
 static bool
 step_pins(void)
 {
-	static const struct {
+	const struct {
 		unsigned pin;
 		const char *what;
-	} pins[] = { { 84, "the radio's enable or reset" }, { 85, "Bluetooth's reset" }, { 86, "Bluetooth's sw-ctrl" } };
+	} pins[] = {
+		{ hakios_board_number("wlan_reset", 84), "the radio's enable or reset" },
+		{ hakios_board_number("bt_reset", 85), "Bluetooth's reset" },
+		{ hakios_board_number("bt_sw", 86), "Bluetooth's sw-ctrl" }
+	};
 
 	announce("read how the firmware left the radio's pins (registers the touch screen's driver uses too)");
 	need(&tlmm);
@@ -1273,8 +1283,8 @@ step_pins(void)
 /* ---- step 6: the firmware ------------------------------------------------------------------------------ */
 
 #define PAS_WPSS                6               /* dt: qcom,pas-id of qcom,wpss@8a00000 */
-#define WPSS_MEMORY             0x9ae00000u     /* dt: reserved-memory wlan@9ae00000, that node's memory-region */
-#define WPSS_MEMORY_SIZE        0x01900000u
+#define WPSS_MEMORY             hakios_board_addr("wpss_mem", 0x9ae00000u)
+#define WPSS_MEMORY_SIZE        hakios_board_number("wpss_size", 0x01900000u)
 
 extern dev_t mdevlookup(int devid);
 extern int mdevgetkernelrange(dev_t dev, vm_offset_t *base, uint64_t *size);
@@ -3592,7 +3602,7 @@ static struct block apps_smmu = { "apps smmu", 0x15000000, 0x2000 };
 #define SMMU_IDR1               0x024           /* bit 31: 64K pages, [30:28] log2(pages)-1, [7:0] translation contexts */
 #define SMMU_SMR(n)             (0x800 + 4 * (n))       /* bit 31 valid, [30:16] mask, [14:0] stream */
 #define SMMU_S2CR(n)            (0xc00 + 4 * (n))       /* [17:16] 0 translate 1 bypass 2 fault, [7:0] context */
-#define RADIO_STREAM            0x1c00
+#define RADIO_STREAM            hakios_board_number("wifi_stream", 0x1c00)
 #define RADIO_STREAM_MASK       0x0001
 
 static void
@@ -3656,7 +3666,7 @@ smmu_look(void)
  * everything read back as written (but two bits that the SMMU does not keep), and the radio
  * then read and wrote the memory it was shown without a fault.
  */
-#define RADIO_ADDRESSES         0xa0000000ull
+#define RADIO_ADDRESSES         hakios_board_addr("wifi_iova", 0xa0000000ull)
 #define RADIO_ADDRESSES_SIZE    0x10000000u
 #define RADIO_TABLES            32              /* of 4K: the root, one of the second level, and 2 MB of addresses each other */
 #define RADIO_PTE               (3ull | 1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11) /* a page; for requests of either
@@ -3670,7 +3680,7 @@ smmu_look(void)
  * tree's node for it, a register of the GIC that raises the SPI whose number is written; the
  * node's interrupts are SPI 768..799, so vector v is the GIC's number 800 + v.
  */
-#define RADIO_MSI_REGISTER      0x17a10040ull
+#define RADIO_MSI_REGISTER      hakios_board_addr("wifi_msi", 0x17a10040ull)
 #define RADIO_FIRST_SPI         768u
 #define PTE_ADDRESS             0x0000fffffffff000ull
 #define SMMU_SGFSR              0x048           /* what the SMMU as a whole has refused ... */
@@ -4018,6 +4028,21 @@ radio_space_try(void)
 
 /* ---- for the driver (hakios.lx.c): the firmware's processor, and files ------------------------------- */
 
+const char *
+hakios_wifi_board_data_file(void)
+{
+	static char file[32];
+	static bool initialized;
+	char board[20];
+
+	if (!initialized) {
+		hakios_board_text("wifi_bdf", "m20gl", board, sizeof(board));
+		snprintf(file, sizeof(file), "bd_%s.elf", board);
+		initialized = true;
+	}
+	return file;
+}
+
 bool
 hakios_wifi_dsp_is_up(void)
 {
@@ -4036,10 +4061,13 @@ hakios_wifi_dsp_is_up(void)
 const uint8_t *
 hakios_wifi_driver_file(const char *name, uint64_t *size)
 {
-	static const char *const files[][2] = { { "board.bin", "bd_m20gl.elf" }, { "regdb.bin", "regdb_xiaomi.bin" } };
+	static const char *const files[][2] = { { "regdb.bin", "regdb_xiaomi.bin" } };
 	const char *last = strrchr(name, '/');
 
 	last = last == NULL ? name : last + 1;
+	if (strcmp(last, "board.bin") == 0) {
+		return image_file(hakios_wifi_board_data_file(), size);
+	}
 	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
 		if (strcmp(last, files[i][0]) == 0) {
 			return image_file(files[i][1], size);
@@ -4325,6 +4353,13 @@ hakios_wifi_init(void)
 		printf("wifi: wifi=%u is not understood: wifi=1 turns the radio on, wifi_step=N goes the first N steps of that\n", on);
 		return;
 	}
+	aoss.phys = hakios_board_addr("aoss", aoss.phys);
+	ipcc.phys = hakios_board_addr("ipcc", ipcc.phys);
+	rsc.phys = hakios_board_addr("rsc", rsc.phys);
+	tlmm.phys = hakios_board_addr("tlmm", tlmm.phys);
+	arb_core.phys = hakios_board_addr("spmi_core", arb_core.phys);
+	arb_cnfg.phys = hakios_board_addr("spmi_cnfg", arb_cnfg.phys);
+	arb_observer.phys = hakios_board_addr("spmi_obsrvr", arb_observer.phys);
 	if (pe_arm_get_soc_base_phys() != HAKIOS_SOC_BASE) {
 		if (last_step != 0 && PE_parse_boot_argn("wifi_lx", &back, sizeof(back)) && back) {
 			/* a check of what is under the driver: it gets as far as finding no firmware to talk to */

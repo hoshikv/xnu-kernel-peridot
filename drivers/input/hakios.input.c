@@ -10,6 +10,8 @@
 #include <sys/errno.h>
 #include <sys/proc.h>
 #include <sys/hakios.input.h>
+#include <sys/hakios.board.h>
+#include <sys/hakios.bluetooth.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
 #include <pexpert/pexpert.h>
@@ -279,17 +281,25 @@ hakios_input_init(void)
 
 	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-touch") == NULL) {
 		printf("hakios-touch: cannot create the device\n");
+		return;
+	}
+	/* Existing small APFS images can carry an older inject library that opens this name. */
+	if (devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-touch") == NULL) {
+		printf("hakios-touch: cannot create the legacy redwood-touch alias\n");
 	}
 	exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
+	hakios_board_report();
 	hakios_cpufreq_init();
 	hakios_virtio_input_init();
 	hakios_goodix_init();
 	hakios_buttons_init();
 	hakios_battery_init();
+	hakios_thermal_init();         /* after cpufreq (the caps) and the battery (its temperature) */
 	hakios_ufs_init();
 	hakios_net_init();
 	hakios_adreno_init();
 	hakios_wifi_init();
+	hakios_bt_init();
 	hakios_adsp_init();
 	hakios_mpss_init();
 }

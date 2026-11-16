@@ -882,7 +882,10 @@ send_button(IOHIDServiceClientRef buttons, const struct hakios_touch *t)
 	}
 	event = IOHIDEventCreateKeyboardEvent(NULL, t->time, HID_PAGE_CONSUMER, usage, t->type == HAKIOS_BUTTON_DOWN, 0);
 	IOHIDEventSetIntegerValue(event, FIELD_IS_BUILT_IN, 1);
-	IOHIDVirtualServiceClientDispatchEvent(buttons, event);
+	Boolean sent = IOHIDVirtualServiceClientDispatchEvent(buttons, event);
+	say("hakios: button: %s (usage 0x%x, finger %u): %s (dispatched=%d)\n",
+	    usage == HID_USAGE_VOLUME_UP ? "volume-up" : usage == HID_USAGE_VOLUME_DOWN ? "volume-down" : "power",
+	    usage, t->finger, t->type == HAKIOS_BUTTON_DOWN ? "pressed" : "released", (int)sent);
 	CFRelease(event);
 }
 

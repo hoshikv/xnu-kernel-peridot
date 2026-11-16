@@ -2093,12 +2093,25 @@ ca_prof_start(void)
 }
 
 /* UniXNU's Metal on Vulkan (NativeBridgeMetalFrontend.h), there when the bundle is linked with it (M2V=1) */
+#ifdef HAKIOS_M2V
 extern id native_bridge_metal_open(const char *loader, const char *cache, uint64_t registryID,
 				   void (*missing)(const char *, const char *)) __attribute__((weak_import));
 extern uint64_t native_bridge_metal_first_problem(char *out, size_t size) __attribute__((weak_import));
 extern size_t native_bridge_metal_status(char *out, size_t size) __attribute__((weak_import));
 extern size_t native_bridge_metal_formats(char *out, size_t size) __attribute__((weak_import));
 extern const void *(*native_bridge_metal_variant_hook)(const char *, const char *, const char *, int, size_t *) __attribute__((weak_import));
+static inline void hm_m2v_install_variant_hook(const void *(*fn)(const char *, const char *, const char *, int, size_t *)) {
+	if (&native_bridge_metal_variant_hook != NULL) {
+		native_bridge_metal_variant_hook = fn;
+	}
+}
+#else
+static id (*const native_bridge_metal_open)(const char *, const char *, uint64_t, void (*)(const char *, const char *)) = NULL;
+static inline uint64_t native_bridge_metal_first_problem(char *out, size_t size) { (void)out; (void)size; return 0; }
+static inline size_t native_bridge_metal_status(char *out, size_t size) { (void)out; (void)size; return 0; }
+static inline size_t native_bridge_metal_formats(char *out, size_t size) { (void)out; (void)size; return 0; }
+static inline void hm_m2v_install_variant_hook(const void *(*fn)(const char *, const char *, const char *, int, size_t *)) { (void)fn; }
+#endif
 static const void *hm_m2v_variant(const char *name, const char *label, const char *pipeline, int vertex, size_t *length);
 
 static char hm_m2v_last_stderr[400];   /* the last line of Turnip's or the runtime's that said error, refused or warning */
@@ -2195,9 +2208,7 @@ hm_boot_arg_set(const char *what)
 			setenv("MESA_GPU_TRACES", "print", 1);
 			setenv("MESA_GPU_TRACEFILE", "/private/var/tmp/m2v-utrace.txt", 1);
 		}
-		if (&native_bridge_metal_variant_hook != NULL) {
-			native_bridge_metal_variant_hook = hm_m2v_variant;
-		}
+		hm_m2v_install_variant_hook(hm_m2v_variant);
 		mkdir("/private/var/db/m2v", 0700);
 		id device = native_bridge_metal_open("/redwood/lib/libvulkan_freedreno.dylib",
 		    access("/private/var/db/m2v", W_OK) == 0 ? "/private/var/db/m2v" : "/private/var/tmp/m2v", 0, hm_m2v_missing);

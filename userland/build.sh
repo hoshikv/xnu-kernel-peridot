@@ -11,6 +11,7 @@
 #                      JOBS="..."   labels of the stock Darwin launchd jobs to load (default: DARWIN_JOBS)
 #                      REST=1       ... and the rest of them, started only when asked for (see mkjobs.py)
 #                      WIFID=0      without wifid, Darwin's Wi-Fi daemon, which is in by default (see below)
+#                      BLUETOOTH=1  ... and Darwin's Bluetooth daemon with our H4 bridge; needs bt=1 in XNU
 #                      OSLOG="..."  labels of the jobs whose os_log output goes to the console ("all": every
 #                                   one of JOBS; default: only the window server, which says little)
 #                      INJECT="..." the programs started with a library of ours, "LIBRARY NAME..." per line
@@ -90,6 +91,7 @@ CC="xnu-clang -arch arm64 -Os -static -nostdlib -ffreestanding -fno-stack-protec
 LD="-Wl,-e,_start -Wl,-pagezero_size,0x100000000"
 DYN="xnu-clang -arch arm64 -isysroot ${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk -O1"
 DARWIN=../sysimage
+[ -d $DARWIN/rootfs ] || [ ! -d ../ios165/rootfs ] || DARWIN=../ios165
 CACHE=$DARWIN/20F66__iPhone10,3_6
 # sysimage/rootfs and sysimage/cryptex must be this copy's own directories of hard links, the way
 # tools/new-workspace.sh makes them. A symlink to another copy's tree makes sysroot a symlink too, because
@@ -111,7 +113,7 @@ DARWIN_JOBS=${JOBS-"
 	com.apple.backboardd com.apple.mobile.usermanagerd com.apple.mobilegestalt.xpc com.apple.lsd
 	com.apple.powerd com.apple.analyticsd com.apple.logd_helper
 	com.apple.iconservices.iconservicesagent com.apple.pluginkit.pkd
-	com.apple.SpringBoard
+	com.apple.SpringBoard com.apple.PosterBoard com.apple.mediaserverd com.apple.mediaremoted
 "}
 # Darwin's own Wi-Fi daemon, for Settings to have a Wi-Fi to show: the kernel answers it in
 # drivers/wifi/hakios.apple80211.c. With the radio (wifi=1) Settings then shows Wi-Fi on, the network joined and the
@@ -124,6 +126,9 @@ DARWIN_JOBS=${JOBS-"
 # (Count a QEMU run log with its duplicate lines removed: run-darwin.sh prints launchd's log twice.)
 # WIFID=0 leaves it out.
 [ "${WIFID-1}" != 0 ] && DARWIN_JOBS="$DARWIN_JOBS com.apple.wifid"
+# Bluetooth needs both the daemon and BlueTool; the kernel has already downloaded the firmware and
+# published the H4 endpoint (bsd/dev/hakios.bt.c, bt=1), so BlueTool only has to answer its boot contract.
+[ "${BLUETOOTH-0}" = 1 ] && DARWIN_JOBS="$DARWIN_JOBS com.apple.bluetoothd com.apple.BlueTool"
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
 # (src/inject.c is libhakios.dylib, src/inject_sb.c is libhakios.sb.dylib, src/inject_media.c is
 # libhakios.media.dylib).
@@ -138,9 +143,15 @@ INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd conta
 /redwood/lib/libhakios.media.dylib mediaserverd
 /redwood/lib/libhakios.app.dylib Sileo
 /redwood/lib/libhakios.tweaks.dylib Preferences"}
+[ "${BLUETOOTH-0}" = 1 ] && INJECT="$INJECT
+/redwood/lib/libhakios.bluetooth.dylib bluetoothd"
 mkdir -p obj
 
 if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
+if [ "${BLUETOOTH-0}" = 1 ] && [ -n "$PREBUILT" ]; then
+	echo "build.sh: BLUETOOTH=1 needs the cross toolchain (theos + iPhoneOS16.5.sdk)" >&2
+	exit 1
+fi
 if [ -n "$PREBUILT" ]; then
 	echo "build.sh: not compiling, using the programs in prebuilt/userland"
 	for f in ../prebuilt/userland/*; do
@@ -195,6 +206,10 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	if [ -z "$PREBUILT" ]; then
 		# ordinary dynamically linked programs of our own, built against the Darwin SDK
 		$DYN -o obj/hello_dyn src/hello_dyn.c
+		if [ "${BLUETOOTH-0}" = 1 ]; then
+			$DYN -fblocks -framework CoreFoundation -framework IOKit -o obj/hakios_bluetool src/hakios_bluetool.c
+			$DYN -dynamiclib -install_name /redwood/lib/libhakios.bluetooth.dylib -framework CoreFoundation -framework IOKit -o obj/libhakios.bluetooth.dylib src/inject_bluetooth.c
+		fi
 		$DYN -framework CoreFoundation -o obj/svc_test src/svc_test.c
 		$DYN -Wno-four-char-constants -framework CoreFoundation -framework IOSurface -o obj/surf_test src/surf_test.c
 		$DYN -o obj/rwtouch src/rwtouch.c
@@ -300,7 +315,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			# M2V=1: with UniXNU's Metal on Vulkan inside, the device boot-arg metal_m2v=1 gives the window server
 			M2V_OBJS=
 			if [ -n "${M2V:-}" ] && [ -f ../xnu-deps/build/m2v/out/frontend.o ]; then
-				M2V_OBJS="../xnu-deps/build/m2v/out/frontend.o ../xnu-deps/build/m2v/out/libadreno_metal_bridge.a -framework CoreFoundation -lc++ -Wl,-dead_strip"
+				M2V_OBJS="-DHAKIOS_M2V ../xnu-deps/build/m2v/out/frontend.o ../xnu-deps/build/m2v/out/libadreno_metal_bridge.a -framework CoreFoundation -lc++ -Wl,-dead_strip"
 				echo "build.sh: with UniXNU's Metal on Vulkan (metal_m2v=1)"
 			fi
 			$DYN -bundle -framework Foundation -framework IOKit -framework IOSurface -framework Metal -lobjc \
@@ -345,6 +360,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		fi
 	fi
 	cp obj/hello_dyn obj/svc_test obj/surf_test obj/rwtouch obj/mg_test root/bin/
+	[ "${BLUETOOTH-0}" = 1 ] && cp obj/hakios_bluetool root/bin/
 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
 	[ -f obj/cputop ] && cp obj/cputop root/bin/
 	[ -f obj/cow_test ] && cp obj/cow_test root/bin/
@@ -371,6 +387,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	mkdir -p root/dev root/private/var
 	mkdir -p root/lib
 	cp obj/libhakios.dylib obj/libhakios.sb.dylib root/lib/
+	[ "${BLUETOOTH-0}" = 1 ] && cp obj/libhakios.bluetooth.dylib root/lib/
 	[ -f obj/libhakios.media.dylib ] && cp obj/libhakios.media.dylib root/lib/     # (as with cpu_test)
 	[ -f obj/libhakios.app.dylib ] && cp obj/libhakios.app.dylib root/lib/
 	[ -f obj/libhakios.tweaks.dylib ] && cp obj/libhakios.tweaks.dylib root/lib/
@@ -427,6 +444,9 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	# the prefix with the root on the flash, downloads every package and index there, and without it each
 	# download ended in "No such file or directory"
 	printf 'd\t700\t501\t501\t/private/var/mobile/tmp\n' >> root/etc/var.skel
+	for d in /private/var/mobile/Library/PosterBoard /private/var/mobile/Library/PaperBoard /private/var/mobile/Library/Wallpaper; do
+		printf 'd\t755\t501\t501\t%s\n' "$d"
+	done >> root/etc/var.skel
 	# Metal's compiled shader stages (HakiosMetalCA.m: HM_CACHE_DIR): in /var/db so that var_store keeps them (it
 	# leaves tmp out), open to every user like tmp, since the window server may not be root
 	printf 'd\t1777\t0\t0\t/private/var/db/hakios-metal-cache\n' >> root/etc/var.skel
@@ -478,15 +498,28 @@ fi
 # board data and the regulatory database (image/qca6750 there; 60 and 24 KB)
 if [ -f ../fw-wifi/wpss.mdt ]; then
 	mkdir -p root/fw
-	install -m 0644 ../fw-wifi/wpss.mdt ../fw-wifi/wpss.b0[2-9] root/fw/
-	for f in bd_m20gl.elf regdb_xiaomi.bin; do
-		[ -f ../fw-wifi/qca6750/$f ] && install -m 0644 ../fw-wifi/qca6750/$f root/fw/
+	install -m 0644 ../fw-wifi/wpss.mdt root/fw/
+	for f in ../fw-wifi/wpss.b0[1-9] ../fw-wifi/wpss.b[1-9][0-9]; do
+		[ -f "$f" ] && install -m 0644 "$f" root/fw/
+	done
+	WIFI_BDF=${WIFI_BDF:-}
+	for f in bd_m20gl.elf ${WIFI_BDF:+bd_${WIFI_BDF}.elf} bd_n16t.elf regdb_xiaomi.bin; do
+		if [ -f "../fw-wifi/qca6750/$f" ]; then install -m 0644 "../fw-wifi/qca6750/$f" "root/fw/$f"
+		elif [ -f "../fw-wifi/$f" ]; then install -m 0644 "../fw-wifi/$f" "root/fw/$f"; fi
 	done
 	# the network the radio is to join: its name on the first line, its passphrase on the second. Yours, and
 	# so not in the repository; it goes where the firmware goes and the kernel reads it there (wifi_join=1)
 	rm -f root/fw/network
 	# SHARE=1: leave it out, for an image that is going to somebody else -- it is a passphrase
 	if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then install -m 0600 ../fw-wifi/network root/fw/network; fi
+fi
+# ... and the Bluetooth patch and NVM, from the phone's /vendor/bt_firmware/image into ../fw-bt
+# (drivers/bluetooth/hakios.bt.c reads them from fw/ before the root is mounted; bt=1)
+if [ -d ../fw-bt ]; then
+	mkdir -p root/fw
+	for f in msbtfw12.mbn msbtfw12.tlv msnv12.bin; do
+		[ -f "../fw-bt/$f" ] && install -m 0644 "../fw-bt/$f" root/fw/
+	done
 fi
 # ... and the vibration motor's waveforms, the phone's /vendor/firmware/aw8697_haptic.bin, from ../fw-haptic
 # (drivers/haptic/hakios.haptic.c, haptic=3; 3.6 KB, the vendor's and not in the repository either)
@@ -517,7 +550,10 @@ done
 # the loader takes.
 if [ -n "$ADSP" ] && [ -f ../fw-audio/adsp.mdt ]; then
 	mkdir -p root/fw
-	install -m 0644 ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] root/fw/
+	install -m 0644 ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[1-9] ../fw-audio/adsp.b[1-9][0-9] root/fw/
+	for f in ../fw-audio/adsp_dtb.*; do
+		[ -f "$f" ] && install -m 0644 "$f" root/fw/
+	done
 fi
 # Firmware that is not there is otherwise silent at build time and speaks only much later, deep in a
 # device log -- "adreno: THE GPU IS NOT STARTED: the small image has no fw/a660_gmu.bin" cost a phone
@@ -525,7 +561,7 @@ fi
 # git worktree add has none of it, and neither has one whose tools/new-workspace.sh predates the fw-*
 # loop there. Say what went in and what was not there to go in; what each one is for is above.
 fwhave= fwnone=
-for d in gpu wifi haptic camera audio; do
+for d in gpu wifi bt haptic camera audio; do
 	if [ -d ../fw-$d ]; then fwhave="$fwhave $d"; else fwnone="$fwnone $d"; fi
 done
 echo "build.sh: fw/: $(ls -1 root/fw 2>/dev/null | wc -l) files from ../fw-*:${fwhave:- none present}${fwnone:+, absent:$fwnone}"
@@ -605,7 +641,7 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 	# from the Darwin volume's /fw, which src/init.c (flash_root) binds to this
 	if [ -f ../fw-audio/adsp.mdt ]; then
 		mkdir -p flashboot/fw
-		cp ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] flashboot/fw/
+		cp ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[1-9] ../fw-audio/adsp.b[1-9][0-9] flashboot/fw/
 	fi
 	if [ -f ../fw-audio/aw882xx_acf.bin ]; then
 		mkdir -p flashboot/fw
@@ -679,7 +715,10 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# it once the root is mounted (drivers/audio/hakios.adsp.c, adsp=1): 20 MB that do not fit beside GL=1 in the small image
 	if [ -f ../fw-audio/adsp.mdt ]; then
 		mkdir -p sysroot/fw
-		cp ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] sysroot/fw/
+		cp ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[1-9] ../fw-audio/adsp.b[1-9][0-9] sysroot/fw/
+		for f in ../fw-audio/adsp_dtb.*; do
+			[ -f "$f" ] && cp "$f" sysroot/fw/
+		done
 	fi
 	# MPSS firmware is much too large for the small boot image. Keep it in the system APFS,
 	# only when explicitly requested, after checking every loadable segment against this DTB.

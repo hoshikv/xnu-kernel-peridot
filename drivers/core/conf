@@ -5,6 +5,9 @@
 standard bsd/dev/hakios.version.c
 	help    kern.hakios.version, and the version in the boot log
 
+standard bsd/dev/hakios.board.c
+	help    per-board MMIO addresses and hardware selectors from board_*= boot-args
+
 standard bsd/dev/hakios.platform.c
 	help    what the drivers share (the locks of the PMIC arbiter, the always-on processor, RPMh and the SMMU), and
 	help    kern.hakios.drivers, the list of the drivers built in

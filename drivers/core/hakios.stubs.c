@@ -135,3 +135,27 @@ void hakios_torch_quiesce(void) {}
 void hakios_camera_init(void) {}
 void hakios_camera_quiesce(void) {}
 #endif
+
+#ifndef HAKIOS_BT
+void hakios_bt_init(void) {}
+#endif
+
+#ifndef HAKIOS_CPUFREQ
+int hakios_cpufreq_top(__unused uint32_t domain) { return -1; }
+uint32_t hakios_cpufreq_khz(__unused uint32_t domain, __unused int row) { return 0; }
+void hakios_cpufreq_cap(__unused uint32_t domain, __unused int row) {}
+#endif
+
+#ifndef HAKIOS_THERMAL
+void hakios_thermal_init(void) {}
+int hakios_thermal_max_mc(void) { return -273000; }
+#endif
+
+#ifndef HAKIOS_DISPLAY
+struct hakios_display_scan;
+int hakios_display_scan_start(void) { return 0; }
+const struct hakios_display_scan *hakios_display_scan(void) { return NULL; }
+uint32_t hakios_display_line(__unused uint32_t *frame) { return 0; }
+int hakios_display_wait_lines(__unused uint32_t first, __unused uint32_t last, __unused uint64_t limit_ns) { return 0; }
+uint64_t hakios_display_next_frame_ns(void) { return 0; }
+#endif

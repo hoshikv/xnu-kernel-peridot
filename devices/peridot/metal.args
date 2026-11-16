@@ -1,0 +1,2 @@
+# Boot-arguments for Metal runs on POCO F6 / Redmi Turbo 3 (peridot, SM8635) - iOS 27 arm64e
+bootcpu=7 cpus=8 cpufreq=1 fb_hz=120 fb_threads=6 touch_poll_us=4000 metal=1 thermal=2 adsp=1 sound=4 battery=1 wifi=1 haptic=5 adreno_stream1=0 small_cores_after=0 touch_no_rpmh=1 ufs=2 ufs_native=1

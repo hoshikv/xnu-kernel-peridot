@@ -1,0 +1,6 @@
+# HakiOS defconfig for the POCO F6 / Redmi Turbo 3 (peridot): common kernel + SM8635 + device + iOS 27 arm64e.
+#include common_defconfig
+#include sm8635.config
+#include peridot.config
+#include arm64e.config
+#include ios-27.config

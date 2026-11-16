@@ -122,19 +122,67 @@ class Node:
         self.oid = 0
 
 
-def read_tree(path, name=''):
+_MACHO_MAGICS = (
+    b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf',
+    b'\xce\xfa\xed\xfe', b'\xfe\xed\xfa\xce',
+    b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca',
+)
+
+
+def _has_posix_modes(path):
+    """False on filesystems that synthesize 0777 (e.g. WSL 9p drvfs without metadata)."""
+    if not os.path.exists('/proc/mounts'):
+        return True
+    real = os.path.realpath(path)
+    best_mp, best_type, best_opts = '', '', ''
+    try:
+        with open('/proc/mounts', 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                fields = line.split()
+                if len(fields) < 4:
+                    continue
+                mp = fields[1].replace('\\040', ' ')
+                if (real == mp or mp == '/' or real.startswith(mp.rstrip('/') + '/')) and len(mp) > len(best_mp):
+                    best_mp, best_type, best_opts = mp, fields[2], fields[3]
+    except OSError:
+        return True
+    if best_type in ('vfat', 'msdos', 'exfat'):
+        return False
+    if best_type == '9p' and 'drvfs' in best_opts:
+        opts = [o for part in best_opts.split(',') for o in (part.split(';') if part.startswith('aname=') else [part])]
+        return 'metadata' in opts
+    return True
+
+
+def _nonposix_reg_mode(path):
+    """Choose 0755 for Mach-O / script files and 0644 otherwise when host lacks POSIX modes."""
+    try:
+        with open(path, 'rb') as f:
+            hdr = f.read(4)
+    except OSError:
+        hdr = b''
+    exe = hdr in _MACHO_MAGICS or hdr[:2] == b'#!'
+    return stat.S_IFREG | (0o755 if exe else 0o644)
+
+
+def read_tree(path, name='', _posix=None):
+    if _posix is None:
+        _posix = _has_posix_modes(path)
     st = os.lstat(path)
     if stat.S_ISDIR(st.st_mode):
-        node = Node(name, st.st_mode)
+        mode = st.st_mode if _posix else (stat.S_IFDIR | 0o755)
+        node = Node(name, mode)
         for entry in sorted(os.listdir(path)):
-            child = read_tree(os.path.join(path, entry), entry)
+            child = read_tree(os.path.join(path, entry), entry, _posix)
             if child is not None:
                 node.children[entry] = child
         return node
     if stat.S_ISREG(st.st_mode):
-        return Node(name, st.st_mode, source=path)
+        mode = st.st_mode if _posix else _nonposix_reg_mode(path)
+        return Node(name, mode, source=path)
     if stat.S_ISLNK(st.st_mode):
-        return Node(name, st.st_mode, target=os.fsencode(os.readlink(path)))
+        mode = st.st_mode if _posix else (stat.S_IFLNK | 0o755)
+        return Node(name, mode, target=os.fsencode(os.readlink(path)))
     return None                         # device nodes, FIFOs, sockets: /dev is devfs
 
 

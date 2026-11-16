@@ -1,8 +1,8 @@
 diff --git a/crates/metal2vulkan-runtime/src/host_memory.rs b/crates/metal2vulkan-runtime/src/host_memory.rs
-index e07a3208..f677399f 100644
+index 16cb96f..6e504be 100644
 --- a/crates/metal2vulkan-runtime/src/host_memory.rs
 +++ b/crates/metal2vulkan-runtime/src/host_memory.rs
-@@ -547,7 +547,20 @@ pub(super) fn host_page() -> Option<u64> {
+@@ -622,7 +622,20 @@ pub(super) fn host_page() -> Option<u64> {
  }
  
  /// The refusal of host memory this device cannot import exactly.
@@ -23,7 +23,7 @@ index e07a3208..f677399f 100644
      Error::Unsupported(Unsupported::not_representable(Feature::HostMemory))
  }
  
-@@ -562,7 +575,9 @@ pub(super) fn refused(error: &Error) -> bool {
+@@ -650,7 +663,9 @@ pub(super) fn unpinnable() -> Error {
  /// driver that refuses the memory is a device gap, anything else a Vulkan failure. Refusing
  /// drivers answer `VK_ERROR_INVALID_EXTERNAL_HANDLE`, but RADV of Mesa 26.0.8 answers
  /// `VK_ERROR_UNKNOWN` for the shared memory 26.2.4 refuses with it, so that is a refusal too.

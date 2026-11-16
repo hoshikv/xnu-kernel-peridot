@@ -53,11 +53,16 @@
 # when the last upload was not from this copy. The record starts empty -- an upload by a copy without
 # this change leaves none -- and `run` says so rather than assuming.
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
+DEVICE=${XL_DEVICE:-$(sed -n 's/^CONFIG_DEVICE="\(.*\)"/\1/p' .config 2>/dev/null)}
+if [ -z "$DEVICE" ]; then
+	if [ -f devices/peridot/peridot.conf ]; then DEVICE=peridot; else DEVICE=redwood; fi
+fi
+[ -f "devices/$DEVICE/$DEVICE.conf" ] && . "devices/$DEVICE/$DEVICE.conf"
 # On a Mac: flock, GNU timeout and stat, and Android's platform-tools, from tools/macos-bin (see its README)
 [ "$(uname)" = Darwin ] && PATH=$PWD/tools/macos-bin:$PWD/tools/macos-bin/platform-tools:$PATH
 # the kernel and the loader built here, or else the ones that come with the repository
-K=hakios-kernel                 # make kernel makes it
-[ -f $K ] || K=prebuilt/hakios-kernel
+K=${XL_KERNEL:-hakios-kernel}   # make kernel makes it
+[ -f "$K" ] || K=prebuilt/hakios-kernel
 L=xnuloader/loader.efi
 if [ ! -f $L ]; then
 	L=prebuilt/loader.efi
@@ -81,7 +86,7 @@ is_loader() { in_fastboot && fb getvar product | grep -q 'product: xnuloader'; }
 state() {
 	if is_loader; then echo loader
 	elif in_fastboot; then echo fastboot
-	elif [ "$(adb get-state 2>/dev/null)" = device ]; then echo android
+	elif [ "$(adb get-state 2>/dev/null | tr -d '\r')" = device ]; then echo android
 	else echo absent; fi
 }
 wait_for() { # wait_for <state> <seconds>
@@ -128,7 +133,7 @@ firmware() {
 	case "${XL_FIRMWARE:-}" in
 	u-boot|silicium) echo "$XL_FIRMWARE"; return ;;
 	esac
-	if [ -f Mu-Silicium/Build/redwoodPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd ] || [ -f devices/redwood/prebuilt/SILICIUM_UEFI.fd ]; then
+	if [ -f "Mu-Silicium/Build/${UEFI_TARGET:-$DEVICE}Pkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd" ] || [ -f "devices/$DEVICE/prebuilt/SILICIUM_UEFI.fd" ]; then
 		echo silicium
 	else
 		echo u-boot
@@ -148,7 +153,7 @@ enter() {
 	xnuloader/mkpayload.py -o usb-payload.bin loader.efi=$L --usb >/dev/null || { echo "xl: payload build failed"; return 1; }
 	case "$(firmware)" in
 	u-boot) tools/mkubootimg.py -d "${DEVICE:-redwood}" -l $L -p usb-payload.bin -o xnu-usb.img >/dev/null ;;
-	*) ./mkxnuimg.py -p usb-payload.bin -o xnu-usb.img >/dev/null ;;
+	*) DEVICE=$DEVICE UEFI_TARGET=$UEFI_TARGET FD_BASE=$FD_BASE FD_SIZE=$FD_SIZE PAYLOAD_BASE=$PAYLOAD_BASE UEFI_FD=$UEFI_FD DTB=$DTB HEADER_VERSION=$HEADER_VERSION ./mkxnuimg.py -p usb-payload.bin -o xnu-usb.img >/dev/null ;;
 	esac || { echo "xl: image build failed ($(firmware))"; return 1; }
 	# Right after the phone enters fastboot the first "boot" is sometimes not taken: try twice.
 	local try

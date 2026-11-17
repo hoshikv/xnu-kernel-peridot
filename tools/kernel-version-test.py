@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/kernel-version.py: how the version string is made, and what it refuses.
 
-  the real VERSION file          -> 2.3.4-hakios-darwin22.5-g<8 hex>, in the form Android's kernels have
+  the real VERSION file          -> 2.3.4-hakios-darwin<major>.<minor>-g<8 hex>, in the form Android's kernels have
   a tracked file changed         -> "-dirty"; a new untracked file is not a change (as in Linux's setlocalversion)
   CONFIG_SOC in a .config        -> "-<soc>" between the Darwin and the commit
   HAKIOS_VERSION_SUFFIX          -> replaces the git part
@@ -19,6 +19,23 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 TOOL = os.path.join(HERE, "kernel-version.py")
 failures = []
+
+
+def version_values():
+    values = {}
+    for line in open(os.path.join(ROOT, "VERSION"), encoding="utf-8"):
+        line = line.split("#", 1)[0].strip()
+        if "=" in line:
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+    return values
+
+
+EXPECTED = version_values()
+DARWIN = EXPECTED["DARWIN"]
+DARWIN_SHORT = ".".join(DARWIN.split(".")[:2])
+XNU = EXPECTED["XNU"]
+NAME = EXPECTED["NAME"]
 
 
 def check(label, ok, detail=""):
@@ -52,12 +69,12 @@ try:
     git(repo, "commit", "-q", "-m", "x")
 
     full = run(repo)
-    check("the full string has the Android form", re.fullmatch(r"\d+\.\d+\.\d+-hakios-darwin22\.5-g[0-9a-f]{8}", full.stdout.strip()) is not None,
+    check("the full string has the Android form", re.fullmatch(r"\d+\.\d+\.\d+-hakios-darwin%s-g[0-9a-f]{8}" % re.escape(DARWIN_SHORT), full.stdout.strip()) is not None,
           full.stdout + full.stderr)
     check("--short is VERSION.PATCHLEVEL.SUBLEVEL", re.fullmatch(r"\d+\.\d+\.\d+", run(repo, "--short").stdout.strip()) is not None)
     check("--release adds EXTRAVERSION", run(repo, "--release").stdout.strip() == run(repo, "--short").stdout.strip() + "-hakios")
-    check("--name and --darwin", run(repo, "--name").stdout.strip() == "Hello Darwin" and
-          run(repo, "--darwin").stdout.split() == ["22.5.0", "xnu-8796.121.2"])
+    check("--name and --darwin", run(repo, "--name").stdout.strip() == NAME and
+          run(repo, "--darwin").stdout.split() == [DARWIN, XNU])
     check("the string starts with the release", full.stdout.startswith(run(repo, "--release").stdout.strip() + "-darwin"))
 
     open(os.path.join(repo, "untracked.txt"), "w").write("new\n")
@@ -69,7 +86,7 @@ try:
 
     open(os.path.join(repo, ".config"), "w").write('# a configuration\nCONFIG_SOC="sc7280"\nCONFIG_CPUS=8\n')
     check("CONFIG_SOC of .config goes between the Darwin and the commit",
-          re.fullmatch(r"\d+\.\d+\.\d+-hakios-darwin22\.5-sc7280-g[0-9a-f]{8}", run(repo).stdout.strip()) is not None, run(repo).stdout)
+          re.fullmatch(r"\d+\.\d+\.\d+-hakios-darwin%s-sc7280-g[0-9a-f]{8}" % re.escape(DARWIN_SHORT), run(repo).stdout.strip()) is not None, run(repo).stdout)
     other = os.path.join(work, "other.config")
     open(other, "w").write('CONFIG_SOC="sm8550"\n')
     check("--config names another configuration", "-sm8550-" in run(repo, "--config", other).stdout, run(repo, "--config", other).stdout)
@@ -83,7 +100,7 @@ try:
     os.makedirs(plain)
     shutil.copyfile(os.path.join(ROOT, "VERSION"), os.path.join(plain, "VERSION"))
     r = run(plain)
-    check("not a git tree: no git part, no failure", r.returncode == 0 and r.stdout.strip() == "%s-darwin22.5" % run(plain, "--release").stdout.strip(),
+    check("not a git tree: no git part, no failure", r.returncode == 0 and r.stdout.strip() == "%s-darwin%s" % (run(plain, "--release").stdout.strip(), DARWIN_SHORT),
           r.stdout + r.stderr)
 
     # malformed files

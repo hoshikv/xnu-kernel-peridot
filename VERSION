@@ -20,5 +20,5 @@ EXTRAVERSION = -hakios
 NAME = Hello Darwin
 
 # the Darwin this kernel is built on: Apple's open xnu tag (xnu/apply.sh fetches it)
-DARWIN = 22.5.0
-XNU = xnu-8796.121.2
+DARWIN = 25.5.0
+XNU = xnu-12377.121.6

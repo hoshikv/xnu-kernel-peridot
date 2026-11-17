@@ -11,7 +11,11 @@ while [ $# -gt 0 ]; do case "$1" in
 name="$(basename "$def" .iig)"
 src="$(find "$SDKH" -name "$name.h" -path '*DriverKit*' | head -1)"
 [ -z "$src" ] && src="$(find "$SDKH" -name "$name.h" | xargs grep -l 'iig(DriverKit' 2>/dev/null | head -1)"
-if [ -z "$src" ]; then echo "iig shim: no pre-generated header for $name" >&2; exit 1; fi
-cp "$src" "$hdr"
+if [ -z "$src" ]; then
+  echo "iig shim: no pre-generated header for $name, using .iig as header" >&2
+  cp "$def" "$hdr"
+else
+  cp "$src" "$hdr"
+fi
 if [ -f "$XNUDEPS/iig-impl/$name.iig.cpp" ]; then cp "$XNUDEPS/iig-impl/$name.iig.cpp" "$impl"
 else echo "/* $name: no DriverKit implementation generated (iig shim) */" > "$impl"; fi
